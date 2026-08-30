@@ -1,0 +1,6 @@
+kurigram
+TgCrypto
+Pyleaves
+python-dotenv
+psutil
+pillow

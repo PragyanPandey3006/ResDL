@@ -1,0 +1,418 @@
+# Copyright (C) @TheSmartBisnu
+# Channel: https://t.me/itsSmartDev
+
+import os
+import asyncio
+from time import time
+from PIL import Image
+from logger import LOGGER
+from typing import Optional
+from asyncio.subprocess import PIPE
+from asyncio import create_subprocess_exec, create_subprocess_shell, wait_for
+
+from pyleaves import Leaves
+from pyrogram.parser import Parser
+from pyrogram.utils import get_channel_id
+from pyrogram.errors import FloodWait, BadRequest
+from pyrogram.types import (
+    InputMediaPhoto,
+    InputMediaVideo,
+    InputMediaDocument,
+    InputMediaAudio,
+    Voice,
+)
+
+from helpers.files import (
+    fileSizeLimit,
+    cleanup_download
+)
+
+from helpers.msg import (
+    get_raw_text
+)
+
+# Progress bar template
+PROGRESS_BAR = """
+Percentage: {percentage:.2f}% | {current}/{total}
+Speed: {speed}/s
+Estimated Time Left: {est_time} seconds
+"""
+
+async def cmd_exec(cmd, shell=False):
+    if shell:
+        proc = await create_subprocess_shell(cmd, stdout=PIPE, stderr=PIPE)
+    else:
+        proc = await create_subprocess_exec(*cmd, stdout=PIPE, stderr=PIPE)
+    stdout, stderr = await proc.communicate()
+    try:
+        stdout = stdout.decode().strip()
+    except Exception:
+        stdout = "Unable to decode the response!"
+    try:
+        stderr = stderr.decode().strip()
+    except Exception:
+        stderr = "Unable to decode the error!"
+    return stdout, stderr, proc.returncode
+
+
+async def get_media_info(path):
+    try:
+        result = await cmd_exec([
+            "ffprobe", "-hide_banner", "-loglevel", "error",
+            "-print_format", "json", "-show_format", "-show_streams", path,
+        ])
+    except Exception as e:
+        LOGGER(__name__).error(f"Get Media Info: {e}. File: {path}")
+        return 0, None, None, None, None
+
+    if result[0] and result[2] == 0:
+        try:
+            import json
+            data = json.loads(result[0])
+
+            fields = data.get("format", {})
+            duration = round(float(fields.get("duration", 0)))
+
+            tags = fields.get("tags", {})
+            artist = tags.get("artist") or tags.get("ARTIST") or tags.get("Artist")
+            title = tags.get("title") or tags.get("TITLE") or tags.get("Title")
+
+            width = None
+            height = None
+            for stream in data.get("streams", []):
+                if stream.get("codec_type") == "video":
+                    width = stream.get("width")
+                    height = stream.get("height")
+                    break
+
+            return duration, artist, title, width, height
+        except Exception as e:
+            LOGGER(__name__).error(f"Error parsing media info: {e}")
+            return 0, None, None, None, None
+    return 0, None, None, None, None
+
+
+async def get_video_thumbnail(video_file, duration):
+    os.makedirs("Assets", exist_ok=True)
+    output = os.path.join("Assets", "video_thumb.jpg")
+
+    if duration is None:
+        duration = (await get_media_info(video_file))[0]
+    if not duration:
+        duration = 3
+    duration //= 2
+
+    if os.path.exists(output):
+        try:
+            os.remove(output)
+        except:
+            pass
+
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-ss", str(duration), "-i", video_file,
+        "-vframes", "1", "-q:v", "2",
+        "-y", output,
+    ]
+    try:
+        _, err, code = await wait_for(cmd_exec(cmd), timeout=60)
+        if code != 0 or not os.path.exists(output):
+            LOGGER(__name__).warning(f"Thumbnail generation failed: {err}")
+            return None
+    except Exception as e:
+        LOGGER(__name__).warning(f"Thumbnail generation error: {e}")
+        return None
+    return output
+
+
+# Generate progress bar for downloading/uploading
+def progressArgs(action: str, progress_message, start_time):
+    return (action, progress_message, start_time, PROGRESS_BAR, "▓", "░")
+
+
+async def send_media(
+    bot, message, media_path, media_type, caption, caption_entities,
+    progress_message, start_time, forward_chat_id=None
+):
+    file_size = os.path.getsize(media_path)
+
+    if not await fileSizeLimit(file_size, message, "upload"):
+        return
+
+    progress_args = progressArgs("📥 Uploading Progress", progress_message, start_time)
+    LOGGER(__name__).info(f"Uploading media: {media_path} ({media_type})")
+
+    sent_message = None
+
+    async def _send_once(cap, ents):
+        nonlocal sent_message
+        if media_type == "photo":
+            sent_message = await message.reply_photo(
+                media_path,
+                caption=cap,
+                caption_entities=ents or None,
+                progress=Leaves.progress_for_pyrogram,
+                progress_args=progress_args,
+            )
+            return
+        if media_type == "video":
+            duration, _, _, width, height = await get_media_info(media_path)
+
+            if not duration or duration == 0:
+                duration = 0
+                LOGGER(__name__).warning(f"Could not extract duration for {media_path}")
+
+            if not width or not height:
+                width = 640
+                height = 480
+
+            thumb = await get_video_thumbnail(media_path, duration)
+
+            sent_message = await message.reply_video(
+                media_path,
+                duration=duration,
+                width=width,
+                height=height,
+                thumb=thumb,
+                caption=cap,
+                caption_entities=ents or None,
+                supports_streaming=True,
+                progress=Leaves.progress_for_pyrogram,
+                progress_args=progress_args,
+            )
+            if thumb:
+                cleanup_download(thumb)
+            return
+        if media_type == "audio":
+            duration, artist, title, _, _ = await get_media_info(media_path)
+            sent_message = await message.reply_audio(
+                media_path,
+                duration=duration,
+                performer=artist,
+                title=title,
+                caption=cap,
+                caption_entities=ents or None,
+                progress=Leaves.progress_for_pyrogram,
+                progress_args=progress_args,
+            )
+            return
+        if media_type == "document":
+            sent_message = await message.reply_document(
+                media_path,
+                caption=cap,
+                caption_entities=ents or None,
+                progress=Leaves.progress_for_pyrogram,
+                progress_args=progress_args,
+            )
+
+    cur_cap = caption or ""
+    cur_ents = caption_entities or []
+    for attempt in range(2):
+        try:
+            await _send_once(cur_cap, cur_ents)
+            break
+        except FloodWait as e:
+            wait_s = int(getattr(e, "value", 0) or 0)
+            LOGGER(__name__).warning(f"FloodWait while uploading media: {wait_s}s")
+            if wait_s > 0 and attempt == 0:
+                await asyncio.sleep(wait_s + 1)
+                continue
+            raise
+        except BadRequest as e:
+            if "ENTITY_TEXT_INVALID" in str(e) and attempt == 0:
+                LOGGER(__name__).warning(f"ENTITY_TEXT_INVALID in caption entities, retrying without entities: {e}")
+                cur_ents = []
+                continue
+            raise
+
+    if forward_chat_id and sent_message:
+        for attempt in range(2):
+            try:
+                await bot.copy_message(
+                    chat_id=forward_chat_id,
+                    from_chat_id=sent_message.chat.id,
+                    message_id=sent_message.id,
+                )
+                LOGGER(__name__).info(f"Copied media to chat: {forward_chat_id}")
+                break
+            except FloodWait as e:
+                wait_s = int(getattr(e, "value", 0) or 0)
+                LOGGER(__name__).warning(f"FloodWait while copying media: {wait_s}s")
+                if wait_s > 0 and attempt == 0:
+                    await asyncio.sleep(wait_s + 1)
+                    continue
+                LOGGER(__name__).error(f"Failed to copy media after retry: FloodWait")
+            except Exception as e:
+                LOGGER(__name__).error(f"Failed to copy media to {forward_chat_id}: {e}")
+                break
+
+
+async def download_single_media(msg, progress_message, start_time):
+    for attempt in range(2):
+        try:
+            media_path = await msg.download(
+                progress=Leaves.progress_for_pyrogram,
+                progress_args=progressArgs(
+                    "📥 Downloading Progress", progress_message, start_time
+                ),
+            )
+
+            raw_cap, raw_ents = get_raw_text(msg.caption, msg.caption_entities)
+
+            if msg.photo:
+                return ("success", media_path, InputMediaPhoto(media=media_path, caption=raw_cap, caption_entities=raw_ents or None))
+            if msg.video:
+                return ("success", media_path, InputMediaVideo(media=media_path, caption=raw_cap, caption_entities=raw_ents or None))
+            if msg.document:
+                return ("success", media_path, InputMediaDocument(media=media_path, caption=raw_cap, caption_entities=raw_ents or None))
+            if msg.audio:
+                return ("success", media_path, InputMediaAudio(media=media_path, caption=raw_cap, caption_entities=raw_ents or None))
+
+        except FloodWait as e:
+            wait_s = int(getattr(e, "value", 0) or 0)
+            LOGGER(__name__).warning(f"FloodWait while downloading media: {wait_s}s")
+            if wait_s > 0 and attempt == 0:
+                await asyncio.sleep(wait_s + 1)
+                continue
+            return ("error", None, None)
+        except Exception as e:
+            LOGGER(__name__).info(f"Error downloading media: {e}")
+            return ("error", None, None)
+
+    return ("skip", None, None)
+
+
+async def processMediaGroup(chat_message, bot, message, forward_chat_id=None):
+    media_group_messages = await chat_message.get_media_group()
+    valid_media = []
+    temp_paths = []
+    invalid_paths = []
+
+    start_time = time()
+    progress_message = await message.reply("📥 Downloading media group...")
+    LOGGER(__name__).info(
+        f"Downloading media group with {len(media_group_messages)} items..."
+    )
+
+    download_tasks = []
+    for msg in media_group_messages:
+        if msg.photo or msg.video or msg.document or msg.audio:
+            download_tasks.append(download_single_media(msg, progress_message, start_time))
+
+    results = await asyncio.gather(*download_tasks, return_exceptions=True)
+
+    for result in results:
+        if isinstance(result, Exception):
+            LOGGER(__name__).error(f"Download task failed: {result}")
+            continue
+
+        status, media_path, media_obj = result
+        if status == "success" and media_path and media_obj:
+            temp_paths.append(media_path)
+            valid_media.append(media_obj)
+        elif status == "error" and media_path:
+            invalid_paths.append(media_path)
+
+    LOGGER(__name__).info(f"Valid media count: {len(valid_media)}")
+
+    if valid_media:
+        sent_messages = []
+        try:
+            for attempt in range(3):
+                try:
+                    sent_messages = await bot.send_media_group(chat_id=message.chat.id, media=valid_media)
+                    await progress_message.delete()
+                    break
+                except FloodWait as e:
+                    wait_s = int(getattr(e, "value", 0) or 0)
+                    LOGGER(__name__).warning(f"FloodWait while sending media group: {wait_s}s")
+                    if wait_s > 0 and attempt < 2:
+                        await asyncio.sleep(wait_s + 1)
+                        continue
+                    raise
+                except BadRequest as e:
+                    if "ENTITY_TEXT_INVALID" in str(e) and attempt == 0:
+                        LOGGER(__name__).warning(f"ENTITY_TEXT_INVALID in media group, retrying without caption entities: {e}")
+                        for m in valid_media:
+                            m.caption_entities = None
+                        continue
+                    raise
+        except Exception:
+            await message.reply(
+                "**❌ Failed to send media group, trying individual uploads**"
+            )
+            for media in valid_media:
+                try:
+                    sent = None
+                    if isinstance(media, InputMediaPhoto):
+                        sent = await bot.send_photo(
+                            chat_id=message.chat.id,
+                            photo=media.media,
+                            caption=media.caption,
+                        )
+                    elif isinstance(media, InputMediaVideo):
+                        sent = await bot.send_video(
+                            chat_id=message.chat.id,
+                            video=media.media,
+                            caption=media.caption,
+                        )
+                    elif isinstance(media, InputMediaDocument):
+                        sent = await bot.send_document(
+                            chat_id=message.chat.id,
+                            document=media.media,
+                            caption=media.caption,
+                        )
+                    elif isinstance(media, InputMediaAudio):
+                        sent = await bot.send_audio(
+                            chat_id=message.chat.id,
+                            audio=media.media,
+                            caption=media.caption,
+                        )
+                    elif isinstance(media, Voice):
+                        sent = await bot.send_voice(
+                            chat_id=message.chat.id,
+                            voice=media.media,
+                            caption=media.caption,
+                        )
+                    if sent:
+                        sent_messages.append(sent)
+                except Exception as individual_e:
+                    await message.reply(
+                        f"Failed to upload individual media: {individual_e}"
+                    )
+
+            await progress_message.delete()
+
+        if forward_chat_id and sent_messages:
+            try:
+                msg_ids = [m.id for m in sent_messages if m]
+                if msg_ids:
+                    source_chat_id = sent_messages[0].chat.id
+                    for attempt in range(2):
+                        try:
+                            await bot.copy_media_group(
+                                chat_id=forward_chat_id,
+                                from_chat_id=source_chat_id,
+                                message_id=msg_ids[0],
+                            )
+                            LOGGER(__name__).info(f"Copied media group to chat: {forward_chat_id}")
+                            break
+                        except FloodWait as e:
+                            wait_s = int(getattr(e, "value", 0) or 0)
+                            LOGGER(__name__).warning(f"FloodWait while copying media group: {wait_s}s")
+                            if wait_s > 0 and attempt == 0:
+                                await asyncio.sleep(wait_s + 1)
+                                continue
+                            raise
+            except Exception as e:
+                LOGGER(__name__).error(f"Failed to copy media group to {forward_chat_id}: {e}")
+
+        for path in temp_paths + invalid_paths:
+            cleanup_download(path)
+        return True
+
+    await progress_message.delete()
+    await message.reply("❌ No valid media found in the media group.")
+    for path in invalid_paths:
+        cleanup_download(path)
+    return False
