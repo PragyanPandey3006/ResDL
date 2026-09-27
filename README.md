@@ -43,10 +43,13 @@ Before you begin, ensure you have met the following requirements:
    - **`BOT_TOKEN`**: The token you obtained from [@BotFather](https://t.me/BotFather).
    - **`FORWARD_CHAT_ID`**: Optional. Set a target channel/group chat ID (example: `-1001234567890`) to automatically copy downloaded content there. Leave empty to disable.
 
-3. Optional performance settings (add to `config.py`):
-   - **`MAX_CONCURRENT_DOWNLOADS`**: Number of simultaneous downloads (default: 3)
-   - **`BATCH_SIZE`**: Number of posts to process in parallel during batch downloads (default: 10)
-   - **`FLOOD_WAIT_DELAY`**: Delay in seconds between batch groups to avoid flood limits (default: 3)
+3. Optional performance settings (in `config.env`). Defaults are tuned to be **flood-safe for large batches (1000–2000 posts) on a single account**:
+   - **`MAX_CONCURRENT_DOWNLOADS`**: Number of simultaneous downloads/uploads (default: 3)
+   - **`BATCH_SIZE`**: Number of posts dispatched per batch before pacing (default: 5)
+   - **`FLOOD_WAIT_DELAY`**: Base delay in seconds between batch groups; grows automatically if FloodWait is hit (default: 8)
+   - **`PER_POST_DELAY`**: Delay in seconds between dispatching individual posts (default: 1.5)
+
+   > 💡 Raising these speeds things up but increases the risk of Telegram FloodWait/bans on big batches. The defaults are intentionally conservative.
 
 ## Deploy the Bot
 

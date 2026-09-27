@@ -40,8 +40,12 @@ class PyroConf(object):
     SESSION_STRING = getenv("SESSION_STRING")
     BOT_START_TIME = time()
 
-    MAX_CONCURRENT_DOWNLOADS = int(getenv("MAX_CONCURRENT_DOWNLOADS", "100"))
-    BATCH_SIZE = int(getenv("BATCH_SIZE", "100"))
-    FLOOD_WAIT_DELAY = int(getenv("FLOOD_WAIT_DELAY", "100"))
+    # Flood-safe defaults for large batches on a single account.
+    MAX_CONCURRENT_DOWNLOADS = int(getenv("MAX_CONCURRENT_DOWNLOADS", "3"))
+    BATCH_SIZE = int(getenv("BATCH_SIZE", "5"))
+    FLOOD_WAIT_DELAY = int(getenv("FLOOD_WAIT_DELAY", "8"))
+    # Small delay between dispatching each individual post inside a batch, to
+    # smooth request bursts. Helps avoid FloodWait on very large ranges.
+    PER_POST_DELAY = float(getenv("PER_POST_DELAY", "1.5"))
 
     FORWARD_CHAT_ID = getenv("FORWARD_CHAT_ID", "").strip() or None

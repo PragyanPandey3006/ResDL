@@ -35,7 +35,9 @@ class LoginManager:
         }
         
     def get_session_path(self, user_id):
-        return os.path.join(self.sessions_dir, f"{user_id}.session")
+        # Session files are created by a Client named f"user_{user_id}" with
+        # workdir=sessions, so the actual file is sessions/user_{user_id}.session.
+        return os.path.join(self.sessions_dir, f"user_{user_id}.session")
     
     def get_user_data_path(self, user_id):
         return os.path.join(self.sessions_dir, f"{user_id}_data.json")
@@ -341,20 +343,43 @@ class LoginManager:
             # Clean up active session
             if user_id in self.user_sessions:
                 client = self.user_sessions[user_id]
+                logged_out_server_side = False
                 try:
+                    # Ensure the client is connected so we can revoke the
+                    # authorization on Telegram's servers.
+                    if not client.is_connected:
+                        try:
+                            await client.connect()
+                        except Exception as connect_err:
+                            LOGGER(__name__).warning(
+                                f"Could not reconnect client for server-side logout (user {user_id}): {connect_err}"
+                            )
+
+                    # client.log_out() terminates the session on Telegram's
+                    # servers, so it disappears from the user's active
+                    # sessions/devices list. It also disconnects the client.
                     if client.is_connected:
-                        await client.stop()
-                    elif hasattr(client, 'session') and client.session:
-                        # Force disconnect if still connected
-                        await client.disconnect()
+                        await client.log_out()
+                        logged_out_server_side = True
                 except Exception as e:
-                    LOGGER(__name__).warning(f"Client cleanup warning for user {user_id}: {e}")
+                    LOGGER(__name__).warning(f"Server-side logout warning for user {user_id}: {e}")
+                    # Fall back to just disconnecting locally.
+                    try:
+                        if client.is_connected:
+                            await client.disconnect()
+                    except Exception as disconnect_err:
+                        LOGGER(__name__).warning(
+                            f"Client disconnect warning for user {user_id}: {disconnect_err}"
+                        )
                 finally:
                     # Always remove from active sessions
                     with self._session_lock:
                         if user_id in self.user_sessions:
                             del self.user_sessions[user_id]
-                    success_messages.append("Active session cleared")
+                    if logged_out_server_side:
+                        success_messages.append("Session terminated on Telegram (removed from your devices)")
+                    else:
+                        success_messages.append("Active session cleared")
             
             # Clean up login state
             await self.cleanup_login_state(user_id)

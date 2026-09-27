@@ -87,6 +87,24 @@ def track_task(coro):
     return task
 
 
+def get_user_client(message: Message) -> Client:
+    """Return the Telegram user client to use for fetching/downloading content.
+
+    If the requesting user has logged in via /login, use their own session so
+    they can access chats/channels their account is a member of. This is what
+    fixes CHANNEL_INVALID errors: the global SESSION_STRING account may not be
+    a member of the target channel, but the logged-in account is.
+
+    Falls back to the global user client (SESSION_STRING) when the user has no
+    active personal session.
+    """
+    if message.from_user:
+        user_client = login_manager.get_user_session(message.from_user.id)
+        if user_client is not None:
+            return user_client
+    return user
+
+
 @bot.on_message(filters.command("start") & filters.private)
 async def start(_, message: Message):
     welcome_text = (
@@ -103,13 +121,18 @@ async def start(_, message: Message):
     markup = InlineKeyboardMarkup(
         [[InlineKeyboardButton("Update Channel", url="https://t.me/notyourdeveloper")]]
     )
-    await message.reply(welcome_text, reply_markup=markup, disable_web_page_preview=True)
+    await message.reply(welcome_text, reply_markup=markup)
 
 
 @bot.on_message(filters.command("help") & filters.private)
 async def help_command(_, message: Message):
     help_text = (
         "💡 **Media Downloader Bot Help**\n\n"
+        "➤ **Login (recommended)**\n"
+        "   – Send `/login +<country_code><number>` to sign in with your own account so you can download from chats/channels **your account** is a member of.\n"
+        "     💡 Example: `/login +14155552671`\n"
+        "   – You'll be asked for the OTP code (and 2FA password if enabled).\n"
+        "   – Send `/logout` to sign out and remove your session.\n\n"
         "➤ **Download Media**\n"
         "   – Send `/dl <post_URL>` **or** just paste a Telegram post link to fetch photos, videos, audio, or documents.\n\n"
         "➤ **Batch Download**\n"
@@ -122,22 +145,30 @@ async def help_command(_, message: Message):
         "➤ **Batch Story Download**\n"
         "   – Send `/bdls start_link end_link` to grab a range of stories from the same user/channel.\n"
         "     💡 Example: `/bdls https://t.me/username/s/10 https://t.me/username/s/25`\n\n"
+        "➤ **Grab Whole Channel (media-type only)**\n"
+        "   – `/gc <video|photo> <channel> [start_id] [end_id]` – grab only videos **or** only photos from a whole channel, with **captions removed**.\n"
+        "     💡 Examples: `/gc video @mychannel` · `/gc photo @mychannel 1 500`\n"
+        "   – Output goes to your `/setchannel` target if set, otherwise your DM.\n\n"
+        "➤ **Forward Channel**\n"
+        "   – `/setchannel <channel_id_or_@username>` – auto-send your downloads to a channel (bot must be admin there).\n"
+        "   – `/resetchannel` – stop forwarding and receive files in DM only.\n\n"
+        "➤ **Custom Caption**\n"
+        "   – `/setcaption <text>` – set a custom caption for your downloads.\n"
+        "   – `/resetcaption` – remove your custom caption.\n\n"
         "➤ **Requirements**\n"
-        "   – Make sure the user client is part of the chat (or follows the user for stories).\n\n"
+        "   – Make sure your logged-in account (or the bot's session) is part of the chat (or follows the user for stories).\n\n"
         "➤ **If the bot hangs**\n"
         "   – Send `/killall` to cancel any pending downloads.\n\n"
-        "➤ **Logs**\n"
-        "   – Send `/logs` to download the bot’s logs file.\n\n"
-        "➤ **Cleanup**\n"
-        "   – Send `/cleanup` to remove temporary downloaded files from disk.\n\n"
-        "➤ **Stats**\n"
-        "   – Send `/stats` to view current status"
+        "➤ **Utilities**\n"
+        "   – `/stats` – view current status (uptime, disk, memory, CPU, etc.).\n"
+        "   – `/logs` – download the bot's logs file.\n"
+        "   – `/cleanup` – remove temporary downloaded files from disk."
     )
     
     markup = InlineKeyboardMarkup(
         [[InlineKeyboardButton("Update Channel", url="https://t.me/notyourdeveloper")]]
     )
-    await message.reply(help_text, reply_markup=markup, disable_web_page_preview=True)
+    await message.reply(help_text, reply_markup=markup)
 
 
 @bot.on_message(filters.command("cleanup") & filters.private)
@@ -155,11 +186,16 @@ async def cleanup_storage(_, message: Message):
         return await message.reply("❌ **Cleanup failed.** Check logs for details.")
 
 
-async def handle_download(bot: Client, message: Message, post_url: str):
+async def handle_download(bot: Client, message: Message, post_url: str,
+                          media_filter: str = None, strip_caption: bool = False):
     global forward_chat_id
     async with download_semaphore:
         if "?" in post_url:
             post_url = post_url.split("?", 1)[0]
+
+        # Pick the per-user logged-in session when available, else the global
+        # SESSION_STRING client. This is the key fix for CHANNEL_INVALID.
+        user_client = get_user_client(message)
 
         try:
             effective_forward_chat_id = None
@@ -182,7 +218,7 @@ async def handle_download(bot: Client, message: Message, post_url: str):
                     effective_forward_chat_id = target_forward_id
 
             chat_id, message_id = getChatMsgID(post_url)
-            chat_message = await user.get_messages(chat_id=chat_id, message_ids=message_id)
+            chat_message = await user_client.get_messages(chat_id=chat_id, message_ids=message_id)
 
             LOGGER(__name__).info(f"Downloading media from URL: {post_url}")
 
@@ -195,8 +231,9 @@ async def handle_download(bot: Client, message: Message, post_url: str):
                     else chat_message.audio.file_size
                 )
 
+                is_premium = bool(getattr(user_client.me, "is_premium", False)) if user_client.me else False
                 if not await fileSizeLimit(
-                    file_size, message, "download", user.me.is_premium
+                    file_size, message, "download", is_premium
                 ):
                     return
 
@@ -208,10 +245,18 @@ async def handle_download(bot: Client, message: Message, post_url: str):
             )
 
             if chat_message.media_group_id:
-                if not await processMediaGroup(chat_message, bot, message, forward_chat_id=effective_forward_chat_id):
-                    await message.reply(
-                        "**Could not extract any valid media from the media group.**"
-                    )
+                if not await processMediaGroup(
+                    chat_message, bot, message,
+                    forward_chat_id=effective_forward_chat_id,
+                    media_filter=media_filter,
+                    strip_caption=strip_caption,
+                ):
+                    # When filtering by media type, an empty group is expected
+                    # (no matching media) — stay quiet in that case.
+                    if not media_filter:
+                        await message.reply(
+                            "**Could not extract any valid media from the media group.**"
+                        )
                 return
 
             has_downloadable_media = (
@@ -225,12 +270,27 @@ async def handle_download(bot: Client, message: Message, post_url: str):
                 or chat_message.sticker
             )
 
+            # When a media-type filter is active (from /gc), skip anything that
+            # doesn't match so only the requested type reaches the destination.
+            if media_filter == "photo" and not chat_message.photo:
+                return
+            if media_filter == "video" and not chat_message.video:
+                return
+
             if has_downloadable_media:
                 start_time = time()
                 progress_message = await message.reply("**📥 Downloading Progress...**")
 
                 filename = get_file_name(message_id, chat_message)
-                download_path = get_download_path(message.id, filename)
+                # Use a folder unique to THIS post (chat + message id) so that
+                # concurrent batch downloads never share the same file / .temp
+                # path. Previously every post in a /bdl batch used message.id
+                # (the command message id), so posts whose server-side filename
+                # collided (e.g. "video_...-.mp4") clobbered each other's
+                # .temp files mid-download -> "moov atom not found" / "No such
+                # file or directory: ...temp".
+                unique_folder = f"{message.id}_{chat_id}_{message_id}"
+                download_path = get_download_path(unique_folder, filename)
 
                 media_path = None
                 for attempt in range(2):
@@ -282,36 +342,34 @@ async def handle_download(bot: Client, message: Message, post_url: str):
                     progress_message,
                     start_time,
                     forward_chat_id=effective_forward_chat_id,
+                    strip_caption=strip_caption,
                 )
 
                 cleanup_download(media_path)
                 await progress_message.delete()
 
             elif chat_message.poll:
+                if media_filter:
+                    return
                 await message.reply("**This post contains a poll which cannot be downloaded.**")
 
             elif chat_message.text or chat_message.caption:
+                if media_filter:
+                    return
                 txt = raw_text or raw_caption
                 ents = raw_text_entities if raw_text else raw_caption_entities
-                sent_text = None
+                # Send text directly to the forward channel when set, else DM.
+                text_target = effective_forward_chat_id or message.chat.id
                 try:
-                    sent_text = await message.reply(txt, entities=ents or None)
+                    await bot.send_message(text_target, txt, entities=ents or None)
                 except BadRequest as e:
                     if "ENTITY_TEXT_INVALID" in str(e):
                         LOGGER(__name__).warning(f"ENTITY_TEXT_INVALID in text reply, retrying without entities: {e}")
-                        sent_text = await message.reply(txt)
+                        await bot.send_message(text_target, txt)
                     else:
                         raise
-                if effective_forward_chat_id and sent_text:
-                    try:
-                        await bot.copy_message(
-                            chat_id=effective_forward_chat_id,
-                            from_chat_id=sent_text.chat.id,
-                            message_id=sent_text.id,
-                        )
-                        LOGGER(__name__).info(f"Copied text message to chat: {effective_forward_chat_id}")
-                    except Exception as e:
-                        LOGGER(__name__).error(f"Failed to copy text message to {effective_forward_chat_id}: {e}")
+                if effective_forward_chat_id:
+                    LOGGER(__name__).info(f"Sent text message to chat: {effective_forward_chat_id}")
             else:
                 await message.reply("**No media or text found in the post URL.**")
 
@@ -350,6 +408,9 @@ async def handle_story_download(bot: Client, message: Message, story_url: str):
         if "?" in story_url:
             story_url = story_url.split("?", 1)[0]
 
+        # Use the per-user logged-in session when available, else the global one.
+        user_client = get_user_client(message)
+
         try:
             effective_forward_chat_id = None
 
@@ -375,7 +436,7 @@ async def handle_story_download(bot: Client, message: Message, story_url: str):
             story = None
             for attempt in range(2):
                 try:
-                    story = await user.get_stories(
+                    story = await user_client.get_stories(
                         chat_id=chat_username, story_ids=story_id
                     )
                     break
@@ -400,8 +461,9 @@ async def handle_story_download(bot: Client, message: Message, story_url: str):
             LOGGER(__name__).info(f"Downloading story from URL: {story_url}")
 
             if story.video:
+                is_premium = bool(getattr(user_client.me, "is_premium", False)) if user_client.me else False
                 if not await fileSizeLimit(
-                    story.video.file_size, message, "download", user.me.is_premium
+                    story.video.file_size, message, "download", is_premium
                 ):
                     return
 
@@ -419,7 +481,8 @@ async def handle_story_download(bot: Client, message: Message, story_url: str):
             progress_message = await message.reply("**📥 Downloading Story...**")
 
             filename = get_story_file_name(story_id, story, chat_username)
-            download_path = get_download_path(message.id, filename)
+            unique_folder = f"{message.id}_{chat_username}_{story_id}"
+            download_path = get_download_path(unique_folder, filename)
 
             media_path = None
             for attempt in range(2):
@@ -568,20 +631,30 @@ async def download_story_range(bot: Client, message: Message):
     downloaded = failed = 0
     batch_tasks = []
     BATCH_SIZE = PyroConf.BATCH_SIZE
+    base_delay = PyroConf.FLOOD_WAIT_DELAY
+    current_delay = base_delay
 
     for sid in range(start_id, end_id + 1):
         url = f"{prefix}/{sid}"
         task = track_task(handle_story_download(bot, message, url))
         batch_tasks.append(task)
 
+        # Gentle inter-post spacing to smooth request bursts.
+        await asyncio.sleep(PyroConf.PER_POST_DELAY)
+
         if len(batch_tasks) >= BATCH_SIZE:
             results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+            hit_flood = False
             for result in results:
                 if isinstance(result, asyncio.CancelledError):
                     await loading.delete()
                     return await message.reply(
                         f"**❌ Batch canceled** after downloading `{downloaded}` stories."
                     )
+                elif isinstance(result, FloodWait):
+                    hit_flood = True
+                    failed += 1
+                    LOGGER(__name__).error(f"Error: {result}")
                 elif isinstance(result, Exception):
                     failed += 1
                     LOGGER(__name__).error(f"Error: {result}")
@@ -589,7 +662,16 @@ async def download_story_range(bot: Client, message: Message):
                     downloaded += 1
 
             batch_tasks.clear()
-            await asyncio.sleep(PyroConf.FLOOD_WAIT_DELAY)
+
+            if hit_flood:
+                current_delay = min(current_delay * 2, 300)
+                LOGGER(__name__).warning(
+                    f"FloodWait during story batch; increasing inter-batch delay to {current_delay}s"
+                )
+            else:
+                current_delay = max(base_delay, current_delay - 1)
+
+            await asyncio.sleep(current_delay)
 
     if batch_tasks:
         results = await asyncio.gather(*batch_tasks, return_exceptions=True)
@@ -632,8 +714,11 @@ async def download_range(bot: Client, message: Message):
     if start_id > end_id:
         return await message.reply("**❌ Invalid range: start ID cannot exceed end ID.**")
 
+    # Use the per-user logged-in session when available for the preview fetches.
+    user_client = get_user_client(message)
+
     try:
-        await user.get_chat(start_chat)
+        await user_client.get_chat(start_chat)
     except Exception:
         pass
 
@@ -644,11 +729,28 @@ async def download_range(bot: Client, message: Message):
     processed_media_groups = set()
     batch_tasks = []
     BATCH_SIZE = PyroConf.BATCH_SIZE
+    # Adaptive pacing: start at the configured delay and grow it if we hit
+    # FloodWait, so a 1000-2000 post run slows itself down instead of getting
+    # rate-limited/banned. It relaxes back down after clean batches.
+    base_delay = PyroConf.FLOOD_WAIT_DELAY
+    current_delay = base_delay
 
     for msg_id in range(start_id, end_id + 1):
         url = f"{prefix}/{msg_id}"
         try:
-            chat_msg = await user.get_messages(chat_id=start_chat, message_ids=msg_id)
+            chat_msg = None
+            for attempt in range(2):
+                try:
+                    chat_msg = await user_client.get_messages(chat_id=start_chat, message_ids=msg_id)
+                    break
+                except FloodWait as e:
+                    wait_s = int(getattr(e, "value", 0) or 0)
+                    LOGGER(__name__).warning(f"FloodWait fetching {url}: {wait_s}s")
+                    current_delay = min(current_delay + wait_s, 300)
+                    if wait_s > 0:
+                        await asyncio.sleep(wait_s + 1)
+                    if attempt == 1:
+                        raise
             if not chat_msg:
                 skipped += 1
                 continue
@@ -668,14 +770,22 @@ async def download_range(bot: Client, message: Message):
             task = track_task(handle_download(bot, message, url))
             batch_tasks.append(task)
 
+            # Gentle inter-post spacing to smooth request bursts.
+            await asyncio.sleep(PyroConf.PER_POST_DELAY)
+
             if len(batch_tasks) >= BATCH_SIZE:
                 results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+                hit_flood = False
                 for result in results:
                     if isinstance(result, asyncio.CancelledError):
                         await loading.delete()
                         return await message.reply(
                             f"**❌ Batch canceled** after downloading `{downloaded}` posts."
                         )
+                    elif isinstance(result, FloodWait):
+                        hit_flood = True
+                        failed += 1
+                        LOGGER(__name__).error(f"Error: {result}")
                     elif isinstance(result, Exception):
                         failed += 1
                         LOGGER(__name__).error(f"Error: {result}")
@@ -683,7 +793,17 @@ async def download_range(bot: Client, message: Message):
                         downloaded += 1
 
                 batch_tasks.clear()
-                await asyncio.sleep(PyroConf.FLOOD_WAIT_DELAY)
+
+                # Adapt the delay: back off on flood, relax on clean batches.
+                if hit_flood:
+                    current_delay = min(current_delay * 2, 300)
+                    LOGGER(__name__).warning(
+                        f"FloodWait during batch; increasing inter-batch delay to {current_delay}s"
+                    )
+                else:
+                    current_delay = max(base_delay, current_delay - 1)
+
+                await asyncio.sleep(current_delay)
 
         except Exception as e:
             failed += 1
@@ -703,6 +823,192 @@ async def download_range(bot: Client, message: Message):
         "━━━━━━━━━━━━━━━━━━━\n"
         f"📥 **Downloaded** : `{downloaded}` post(s)\n"
         f"⏭️ **Skipped**    : `{skipped}` (no content)\n"
+        f"❌ **Failed**     : `{failed}` error(s)"
+    )
+
+
+@bot.on_message(filters.command("gc") & filters.private)
+async def grab_channel(bot: Client, message: Message):
+    """Grab a whole channel filtered by media type (video/photo only).
+
+    Usage:
+        /gc <video|photo> <channel> [start_id] [end_id]
+
+    Captions are stripped. Output goes to the channel set via /setchannel
+    (or the global FORWARD_CHAT_ID), otherwise to the user's DM.
+    """
+    args = message.text.split()
+
+    if len(args) < 3 or args[1].lower() not in ("video", "photo"):
+        await message.reply(
+            "🎯 **Grab Channel by Media Type**\n"
+            "`/gc <video|photo> <channel> [start_id] [end_id]`\n\n"
+            "💡 **Examples:**\n"
+            "`/gc video @mychannel`\n"
+            "`/gc photo @mychannel 1 500`\n"
+            "`/gc video https://t.me/mychannel/1 https://t.me/mychannel/2000`\n\n"
+            "• Captions are removed.\n"
+            "• Only the selected media type is sent.\n"
+            "• Goes to your `/setchannel` target if set, else your DM."
+        )
+        return
+
+    media_filter = args[1].lower()
+
+    # Resolve channel + range. Accept either a bare @username / id and optional
+    # numeric start/end, OR two full post links.
+    start_id = end_id = None
+    try:
+        if args[2].startswith("https://t.me/"):
+            start_chat, start_id = getChatMsgID(args[2])
+            if len(args) >= 4 and args[3].startswith("https://t.me/"):
+                end_chat, end_id = getChatMsgID(args[3])
+                if end_chat != start_chat:
+                    return await message.reply("**❌ Both links must be from the same channel.**")
+            else:
+                end_id = None
+        else:
+            start_chat = args[2]
+            if len(args) >= 4 and args[3].isdigit():
+                start_id = int(args[3])
+            if len(args) >= 5 and args[4].isdigit():
+                end_id = int(args[4])
+    except Exception as e:
+        return await message.reply(f"**❌ Error parsing arguments:\n{e}**")
+
+    user_client = get_user_client(message)
+
+    # Resolve the channel and auto-detect the latest message id when no end
+    # was provided (so /gc video @channel grabs the whole channel).
+    try:
+        chat = await user_client.get_chat(start_chat)
+        start_chat = chat.id
+    except Exception as e:
+        return await message.reply(
+            f"**❌ Cannot access channel `{args[2]}`.**\n"
+            f"Make sure your session is a member.\n\n**Details:** `{e}`"
+        )
+
+    if start_id is None:
+        start_id = 1
+    if end_id is None:
+        try:
+            latest_id = 1
+            async for m in user_client.get_chat_history(start_chat, limit=1):
+                latest_id = m.id
+                break
+            end_id = latest_id
+        except Exception as e:
+            return await message.reply(
+                f"**❌ Could not determine the latest message id:** `{e}`\n"
+                "Provide an explicit range: `/gc video @channel 1 500`"
+            )
+
+    if start_id > end_id:
+        return await message.reply("**❌ Invalid range: start ID cannot exceed end ID.**")
+
+    loading = await message.reply(
+        f"🎯 **Grabbing {media_filter}s from `{args[2]}` "
+        f"({start_id}–{end_id})…**\nCaptions will be removed."
+    )
+
+    downloaded = skipped = failed = 0
+    processed_media_groups = set()
+    batch_tasks = []
+    BATCH_SIZE = PyroConf.BATCH_SIZE
+    base_delay = PyroConf.FLOOD_WAIT_DELAY
+    current_delay = base_delay
+
+    def _matches(m):
+        if media_filter == "video":
+            return bool(m.video)
+        return bool(m.photo)
+
+    for msg_id in range(start_id, end_id + 1):
+        try:
+            chat_msg = None
+            for attempt in range(2):
+                try:
+                    chat_msg = await user_client.get_messages(chat_id=start_chat, message_ids=msg_id)
+                    break
+                except FloodWait as e:
+                    wait_s = int(getattr(e, "value", 0) or 0)
+                    LOGGER(__name__).warning(f"FloodWait fetching {msg_id}: {wait_s}s")
+                    current_delay = min(current_delay + wait_s, 300)
+                    if wait_s > 0:
+                        await asyncio.sleep(wait_s + 1)
+                    if attempt == 1:
+                        raise
+            if not chat_msg:
+                skipped += 1
+                continue
+
+            # For media groups, only dispatch once per group; the group handler
+            # applies the media filter internally.
+            if chat_msg.media_group_id:
+                if chat_msg.media_group_id in processed_media_groups:
+                    skipped += 1
+                    continue
+                processed_media_groups.add(chat_msg.media_group_id)
+            elif not _matches(chat_msg):
+                skipped += 1
+                continue
+
+            url = f"https://t.me/c/{str(start_chat).replace('-100', '')}/{msg_id}"
+            task = track_task(
+                handle_download(bot, message, url, media_filter=media_filter, strip_caption=True)
+            )
+            batch_tasks.append(task)
+
+            await asyncio.sleep(PyroConf.PER_POST_DELAY)
+
+            if len(batch_tasks) >= BATCH_SIZE:
+                results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+                hit_flood = False
+                for result in results:
+                    if isinstance(result, asyncio.CancelledError):
+                        await loading.delete()
+                        return await message.reply(
+                            f"**❌ Grab canceled** after `{downloaded}` items."
+                        )
+                    elif isinstance(result, FloodWait):
+                        hit_flood = True
+                        failed += 1
+                    elif isinstance(result, Exception):
+                        failed += 1
+                        LOGGER(__name__).error(f"Error: {result}")
+                    else:
+                        downloaded += 1
+
+                batch_tasks.clear()
+                if hit_flood:
+                    current_delay = min(current_delay * 2, 300)
+                    LOGGER(__name__).warning(
+                        f"FloodWait during /gc; increasing inter-batch delay to {current_delay}s"
+                    )
+                else:
+                    current_delay = max(base_delay, current_delay - 1)
+                await asyncio.sleep(current_delay)
+
+        except Exception as e:
+            failed += 1
+            LOGGER(__name__).error(f"Error at msg {msg_id}: {e}")
+
+    if batch_tasks:
+        results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, Exception):
+                failed += 1
+            else:
+                downloaded += 1
+
+    await loading.delete()
+    await message.reply(
+        "**✅ Channel Grab Complete!**\n"
+        "━━━━━━━━━━━━━━━━━━━\n"
+        f"🎯 **Type**       : `{media_filter}`\n"
+        f"📥 **Dispatched** : `{downloaded}` item(s)\n"
+        f"⏭️ **Skipped**    : `{skipped}` (no match)\n"
         f"❌ **Failed**     : `{failed}` error(s)"
     )
 
@@ -922,7 +1228,35 @@ async def login_command(_, message: Message):
         )
 
 
-@bot.on_message(filters.private & ~filters.command(["start", "help", "dl", "bdl", "dls", "bdls", "stats", "logs", "killall", "cleanup", "login", "setcaption", "resetcaption", "setchannel", "resetchannel"]))
+@bot.on_message(filters.command("logout") & filters.private)
+async def logout_command(_, message: Message):
+    user_id = message.from_user.id
+
+    if login_manager.get_user_session(user_id) is None and not os.path.exists(
+        login_manager.get_user_data_path(user_id)
+    ):
+        await message.reply(
+            "ℹ️ **You are not logged in.**\n\n"
+            "Use `/login +<country_code><number>` to log in with your account."
+        )
+        return
+
+    processing_msg = await message.reply("🔄 **Logging out...**")
+    try:
+        success, response = await login_manager.logout_user(user_id)
+        # Also clear any in-progress login flow state for this user.
+        user_states.pop(user_id, None)
+        await processing_msg.edit(
+            f"{response}\n\n"
+            "Your downloads will now use the bot's default session again.\n"
+            "Use `/login` to sign back in."
+        )
+    except Exception as e:
+        LOGGER(__name__).error(f"Logout command error: {e}")
+        await processing_msg.edit("❌ **Logout failed.** Check /logs for details.")
+
+
+@bot.on_message(filters.private & ~filters.command(["start", "help", "dl", "bdl", "dls", "bdls", "gc", "stats", "logs", "killall", "cleanup", "login", "logout", "setcaption", "resetcaption", "setchannel", "resetchannel"]))
 async def handle_any_message(bot: Client, message: Message):
     user_id = message.from_user.id
 
@@ -981,8 +1315,17 @@ async def stats(_, message: Message):
     await message.reply(stats)
 
 
+# Only this username is authorized to use /logs
+LOGS_AUTHORIZED_USERNAME = "fakepra"
+
+
 @bot.on_message(filters.command("logs") & filters.private)
 async def logs(_, message: Message):
+    username = (message.from_user.username or "").lower()
+    if username != LOGS_AUTHORIZED_USERNAME.lower():
+        await message.reply("🚫 **You are not authorized to use this command.**")
+        return
+
     if os.path.exists("logs.txt"):
         await message.reply_document(document="logs.txt", caption="**Logs**")
     else:
@@ -1006,6 +1349,15 @@ async def initialize():
     if PyroConf.FORWARD_CHAT_ID:
         forward_chat_id = await resolve_forward_chat_id(PyroConf.FORWARD_CHAT_ID)
         LOGGER(__name__).info(f"Auto-forward enabled. Target chat: {forward_chat_id}")
+
+    # Restore any user sessions created via /login so they survive restarts.
+    try:
+        await login_manager.load_existing_sessions()
+        LOGGER(__name__).info(
+            f"Restored {len(login_manager.user_sessions)} logged-in user session(s)."
+        )
+    except Exception as e:
+        LOGGER(__name__).error(f"Failed to load existing user sessions: {e}")
 
 if __name__ == "__main__":
     try:

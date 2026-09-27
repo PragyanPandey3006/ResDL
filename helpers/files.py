@@ -2,6 +2,7 @@
 # Channel: https://t.me/notyourdeveloper
 
 import os
+import re
 import shutil
 from typing import Optional
 
@@ -9,8 +10,11 @@ from logger import LOGGER
 
 SIZE_UNITS = ["B", "KB", "MB", "GB", "TB", "PB"]
 
-def get_download_path(folder_id: int, filename: str, root_dir: str = "downloads") -> str:
+def get_download_path(folder_id, filename: str, root_dir: str = "downloads") -> str:
     safe_name = os.path.basename(filename)
+    # Sanitize the folder id so a chat username / negative chat id can't escape
+    # the downloads root or create odd nested paths.
+    folder_id = re.sub(r"[^A-Za-z0-9_.-]", "_", str(folder_id))
     if not safe_name:
         safe_name = str(folder_id)
     folder = os.path.join(root_dir, str(folder_id))
