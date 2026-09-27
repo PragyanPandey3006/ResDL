@@ -1,11 +1,11 @@
 <h1 align="center">Restricted Content Downloader Telegram Bot</h1>
 
 <p align="center">
-  <a href="https://github.com/bisnuray/RestrictedContentDL/stargazers"><img src="https://img.shields.io/github/stars/bisnuray/RestrictedContentDL?color=blue&style=flat" alt="GitHub Repo stars"></a>
-  <a href="https://github.com/bisnuray/RestrictedContentDL/issues"><img src="https://img.shields.io/github/issues/bisnuray/RestrictedContentDL" alt="GitHub issues"></a>
-  <a href="https://github.com/bisnuray/RestrictedContentDL/pulls"><img src="https://img.shields.io/github/issues-pr/bisnuray/RestrictedContentDL" alt="GitHub pull requests"></a>
-  <a href="https://github.com/bisnuray/RestrictedContentDL/graphs/contributors"><img src="https://img.shields.io/github/contributors/bisnuray/RestrictedContentDL?style=flat" alt="GitHub contributors"></a>
-  <a href="https://github.com/bisnuray/RestrictedContentDL/network/members"><img src="https://img.shields.io/github/forks/bisnuray/RestrictedContentDL?style=flat" alt="GitHub forks"></a>
+  <a href="https://github.com/NotYourDeveloper/RestrictedContentDL/stargazers"><img src="https://img.shields.io/github/stars/NotYourDeveloper/RestrictedContentDL?color=blue&style=flat" alt="GitHub Repo stars"></a>
+  <a href="https://github.com/NotYourDeveloper/RestrictedContentDL/issues"><img src="https://img.shields.io/github/issues/NotYourDeveloper/RestrictedContentDL" alt="GitHub issues"></a>
+  <a href="https://github.com/NotYourDeveloper/RestrictedContentDL/pulls"><img src="https://img.shields.io/github/issues-pr/NotYourDeveloper/RestrictedContentDL" alt="GitHub pull requests"></a>
+  <a href="https://github.com/NotYourDeveloper/RestrictedContentDL/graphs/contributors"><img src="https://img.shields.io/github/contributors/NotYourDeveloper/RestrictedContentDL?style=flat" alt="GitHub contributors"></a>
+  <a href="https://github.com/NotYourDeveloper/RestrictedContentDL/network/members"><img src="https://img.shields.io/github/forks/NotYourDeveloper/RestrictedContentDL?style=flat" alt="GitHub forks"></a>
 </p>
 
 <p align="center">
@@ -52,7 +52,7 @@ Before you begin, ensure you have met the following requirements:
 
 1. Clone the repository:
    ```sh
-   git clone https://github.com/bisnuray/RestrictedContentDL
+   git clone https://github.com/NotYourDeveloper/RestrictedContentDL
    cd RestrictedContentDL
    ```
 
@@ -92,7 +92,7 @@ docker compose down
 
 ## Author
 
-- Name: Bisnu Ray
-- Telegram: [@itsSmartDev](https://t.me/itsSmartDev)
+- Name: NotYourDeveloper
+- Telegram: [@NotYourDeveloper](https://t.me/notyourdeveloper)
 
 > **Note**: If you found this repo helpful, please fork and star it. Also, feel free to share with proper credit!

@@ -1,5 +1,5 @@
-# Copyright (C) @TheSmartBisnu
-# Channel: https://t.me/itsSmartDev
+# Copyright (C) @NotYourDeveloper
+# Channel: https://t.me/notyourdeveloper
 
 from os import getenv
 from time import time
@@ -40,8 +40,8 @@ class PyroConf(object):
     SESSION_STRING = getenv("SESSION_STRING")
     BOT_START_TIME = time()
 
-    MAX_CONCURRENT_DOWNLOADS = int(getenv("MAX_CONCURRENT_DOWNLOADS", "1"))
-    BATCH_SIZE = int(getenv("BATCH_SIZE", "1"))
-    FLOOD_WAIT_DELAY = int(getenv("FLOOD_WAIT_DELAY", "10"))
+    MAX_CONCURRENT_DOWNLOADS = int(getenv("MAX_CONCURRENT_DOWNLOADS", "100"))
+    BATCH_SIZE = int(getenv("BATCH_SIZE", "100"))
+    FLOOD_WAIT_DELAY = int(getenv("FLOOD_WAIT_DELAY", "100"))
 
     FORWARD_CHAT_ID = getenv("FORWARD_CHAT_ID", "").strip() or None

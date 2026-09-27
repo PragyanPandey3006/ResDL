@@ -1,5 +1,5 @@
-# Copyright (C) @TheSmartBisnu
-# Channel: https://t.me/itsSmartDev
+# Copyright (C) @NotYourDeveloper
+# Channel: https://t.me/notyourdeveloper
 
 import re
 

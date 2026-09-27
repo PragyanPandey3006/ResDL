@@ -1,5 +1,6 @@
-# Copyright (C) @TheSmartBisnu
-# Channel: https://t.me/itsSmartDev
+# Copyright (C) @NotYourDeveloper
+# Copyright (C) @NotYourDeveloper
+# Channel: https://t.me/notyourdeveloper
 
 import os
 import shutil
@@ -10,7 +11,7 @@ from time import time
 from pyleaves import Leaves
 from pyrogram.enums import ParseMode
 from pyrogram import Client, filters
-from pyrogram.errors import PeerIdInvalid, BadRequest, FloodWait
+from pyrogram.errors import PeerIdInvalid, BadRequest, FloodWait, UserNotParticipant
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 
 from helpers.utils import (
@@ -38,6 +39,10 @@ from helpers.msg import (
     get_story_file_name,
     get_raw_text
 )
+
+from helpers.caption_manager import CaptionManager
+from helpers.login_manager import LoginManager
+from helpers.channel_manager import ChannelManager
 
 from config import PyroConf
 from logger import LOGGER
@@ -67,6 +72,12 @@ RUNNING_TASKS = set()
 download_semaphore = None
 forward_chat_id = None
 
+# Feature managers (login / custom captions) and per-user login flow state
+login_manager = LoginManager(PyroConf.API_ID, PyroConf.API_HASH)
+caption_manager = CaptionManager()
+channel_manager = ChannelManager()
+user_states = {}
+
 def track_task(coro):
     task = asyncio.create_task(coro)
     RUNNING_TASKS.add(task)
@@ -90,7 +101,7 @@ async def start(_, message: Message):
     )
 
     markup = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("Update Channel", url="https://t.me/itsSmartDev")]]
+        [[InlineKeyboardButton("Update Channel", url="https://t.me/notyourdeveloper")]]
     )
     await message.reply(welcome_text, reply_markup=markup, disable_web_page_preview=True)
 
@@ -124,7 +135,7 @@ async def help_command(_, message: Message):
     )
     
     markup = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("Update Channel", url="https://t.me/itsSmartDev")]]
+        [[InlineKeyboardButton("Update Channel", url="https://t.me/notyourdeveloper")]]
     )
     await message.reply(help_text, reply_markup=markup, disable_web_page_preview=True)
 
@@ -152,15 +163,23 @@ async def handle_download(bot: Client, message: Message, post_url: str):
 
         try:
             effective_forward_chat_id = None
-            if forward_chat_id:
-                ok, err_msg = await check_forward_permission(bot, forward_chat_id)
+
+            # Per-user channel set via /setchannel takes precedence over the
+            # global FORWARD_CHAT_ID. Falls back to the global config if unset.
+            user_channel_id = None
+            if message.from_user:
+                user_channel_id = channel_manager.get_channel(message.from_user.id)
+
+            target_forward_id = user_channel_id or forward_chat_id
+            if target_forward_id:
+                ok, err_msg = await check_forward_permission(bot, target_forward_id)
                 if not ok:
                     await message.reply(
                         f"⚠️ **Forward chat misconfigured:** {err_msg}\n\n"
                         "The file will be sent to you only."
                     )
                 else:
-                    effective_forward_chat_id = forward_chat_id
+                    effective_forward_chat_id = target_forward_id
 
             chat_id, message_id = getChatMsgID(post_url)
             chat_message = await user.get_messages(chat_id=chat_id, message_ids=message_id)
@@ -333,15 +352,23 @@ async def handle_story_download(bot: Client, message: Message, story_url: str):
 
         try:
             effective_forward_chat_id = None
-            if forward_chat_id:
-                ok, err_msg = await check_forward_permission(bot, forward_chat_id)
+
+            # Per-user channel set via /setchannel takes precedence over the
+            # global FORWARD_CHAT_ID. Falls back to the global config if unset.
+            user_channel_id = None
+            if message.from_user:
+                user_channel_id = channel_manager.get_channel(message.from_user.id)
+
+            target_forward_id = user_channel_id or forward_chat_id
+            if target_forward_id:
+                ok, err_msg = await check_forward_permission(bot, target_forward_id)
                 if not ok:
                     await message.reply(
                         f"⚠️ **Forward chat misconfigured:** {err_msg}\n\n"
                         "The file will be sent to you only."
                     )
                 else:
-                    effective_forward_chat_id = forward_chat_id
+                    effective_forward_chat_id = target_forward_id
 
             chat_username, story_id = getStoryChatMsgID(story_url)
 
@@ -680,8 +707,242 @@ async def download_range(bot: Client, message: Message):
     )
 
 
-@bot.on_message(filters.private & ~filters.command(["start", "help", "dl", "bdl", "dls", "bdls", "stats", "logs", "killall", "cleanup"]))
+@bot.on_message(filters.command("setchannel") & filters.private)
+async def set_channel_command(_, message: Message):
+    user_id = message.from_user.id
+
+    if len(message.command) < 2:
+        current_channel = channel_manager.get_channel(user_id)
+        if current_channel:
+            await message.reply(
+                f"📢 **Current Channel:** `{current_channel}`\n\n"
+                "To change it, use: `/setchannel <channel_id_or_username>`\n"
+                "To reset it, use: `/resetchannel`"
+            )
+        else:
+            await message.reply(
+                "📢 **Set Extraction Channel**\n\n"
+                "Usage: `/setchannel <channel_id>` or `/setchannel <@username>`\n\n"
+                "**Examples:**\n"
+                "• `/setchannel -1001234567890`\n"
+                "• `/setchannel @mychannel`\n\n"
+                "**Note:** Make sure to add the bot to the channel as admin!"
+            )
+        return
+
+    channel_input = message.command[1]
+
+    try:
+        # Try to get channel info
+        if channel_input.startswith("@"):
+            # Username provided
+            try:
+                channel_info = await bot.get_chat(channel_input)
+                channel_id = channel_info.id
+                channel_name = channel_info.title or channel_input
+            except Exception:
+                await message.reply(f"❌ **Channel not found:** {channel_input}")
+                return
+        else:
+            # Channel ID provided
+            try:
+                channel_id = int(channel_input)
+                try:
+                    channel_info = await bot.get_chat(channel_id)
+                    channel_name = channel_info.title or str(channel_id)
+                except Exception:
+                    channel_name = str(channel_id)
+            except ValueError:
+                await message.reply("❌ **Invalid channel ID format.**")
+                return
+
+        # Check if bot is admin in the channel
+        try:
+            bot_member = await bot.get_chat_member(channel_id, bot.me.id)
+            if not bot_member.privileges or not (
+                bot_member.privileges.can_post_messages
+                or bot_member.privileges.can_edit_messages
+            ):
+                await message.reply(
+                    f"❌ **Bot is not admin in {channel_name}**\n\n"
+                    "Please add the bot to the channel as admin with post messages permission."
+                )
+                return
+        except UserNotParticipant:
+            await message.reply(
+                f"❌ **Bot is not a member of {channel_name}**\n\n"
+                "Please add the bot to the channel first."
+            )
+            return
+        except Exception as e:
+            await message.reply(f"❌ **Error checking channel permissions:** {str(e)}")
+            return
+
+        # Set channel
+        if channel_manager.set_channel(user_id, channel_id):
+            await message.reply(
+                f"✅ **Channel Set Successfully!**\n\n"
+                f"📢 **Channel:** {channel_name}\n"
+                f"🆔 **ID:** `{channel_id}`\n\n"
+                "Now all your downloaded files will be sent to this channel.\n\n"
+                "Use `/resetchannel` to reset back to DM."
+            )
+        else:
+            await message.reply("❌ **Failed to set channel.**")
+
+    except Exception as e:
+        await message.reply(f"❌ **Error:** {str(e)}")
+
+
+@bot.on_message(filters.command("resetchannel") & filters.private)
+async def reset_channel_command(_, message: Message):
+    user_id = message.from_user.id
+
+    current_channel = channel_manager.get_channel(user_id)
+
+    if not current_channel:
+        await message.reply("❌ **No channel is currently set.**")
+        return
+
+    if channel_manager.reset_channel(user_id):
+        await message.reply(
+            f"✅ **Channel Reset Successfully!**\n\n"
+            f"📢 **Previous Channel:** `{current_channel}`\n\n"
+            "Your downloaded files will now be sent to DM only."
+        )
+    else:
+        await message.reply("❌ **Failed to reset channel.**")
+
+
+@bot.on_message(filters.command("setcaption") & filters.private)
+async def set_caption_command(_, message: Message):
+    user_id = message.from_user.id
+
+    if len(message.command) < 2:
+        current_caption = caption_manager.get_caption(user_id)
+        if current_caption:
+            await message.reply(
+                f"📝 **Current Caption:** `{current_caption}`\n\n"
+                "To change it, use: `/setcaption <new_caption>`\n"
+                "To reset it, use: `/resetcaption`"
+            )
+        else:
+            await message.reply(
+                "📝 **Set Custom Caption**\n\n"
+                "Usage: `/setcaption <your_caption>`\n\n"
+                "**Example:** `/setcaption My Downloaded File`\n\n"
+                "This caption will be saved for your downloads."
+            )
+        return
+
+    # Get caption from command (everything after /setcaption)
+    caption = message.text.split(maxsplit=1)[1]
+
+    if len(caption) > 200:
+        await message.reply("❌ **Caption too long!** Maximum 200 characters allowed.")
+        return
+
+    if caption_manager.set_caption(user_id, caption):
+        await message.reply(
+            f"✅ **Caption Set Successfully!**\n\n"
+            f"📝 **Caption:** `{caption}`\n\n"
+            "Use `/resetcaption` to reset the caption."
+        )
+    else:
+        await message.reply("❌ **Failed to set caption.** Please try again.")
+
+
+@bot.on_message(filters.command("resetcaption") & filters.private)
+async def reset_caption_command(_, message: Message):
+    user_id = message.from_user.id
+
+    current_caption = caption_manager.get_caption(user_id)
+
+    if not current_caption:
+        await message.reply("❌ **No caption is currently set.**")
+        return
+
+    if caption_manager.remove_caption(user_id):
+        await message.reply(
+            f"✅ **Caption Reset Successfully!**\n\n"
+            f"📝 **Previous Caption:** `{current_caption}`\n\n"
+            "Your downloaded files will no longer have custom captions."
+        )
+    else:
+        await message.reply("❌ **Failed to reset caption.** Please try again.")
+
+
+@bot.on_message(filters.command("login") & filters.private)
+async def login_command(_, message: Message):
+    user_id = message.from_user.id
+
+    if len(message.command) < 2:
+        await message.reply(
+            "📱 **Login to Your Telegram Account**\n\n"
+            "To login, send your phone number with country code:\n"
+            "**Example:** `/login +1234567890`\n\n"
+            "**Supported formats:**\n"
+            "• `/login +1234567890`\n"
+            "• `/login 1234567890`\n"
+            "• `/login 001234567890`\n\n"
+            "⚠️ **Note:** Make sure your phone number is correct as you'll receive an OTP."
+        )
+        return
+
+    phone_number = message.command[1]
+
+    # Show processing message
+    processing_msg = await message.reply(
+        "🔄 **Starting login process...**\n\n"
+        "Please wait while we connect to Telegram servers."
+    )
+
+    try:
+        success, response = await login_manager.start_login_process(user_id, phone_number)
+
+        if success:
+            user_states[user_id] = "waiting_for_code"
+            await processing_msg.edit(
+                f"✅ {response}\n\n"
+                "💡 **Tip:** Send the code exactly as you receive it (with or without spaces)."
+            )
+        else:
+            await processing_msg.edit(
+                f"{response}\n\n"
+                "💡 **Need help?** Make sure:\n"
+                "• Phone number includes country code\n"
+                "• You have access to this phone number\n"
+                "• Try again in a few minutes if you see app update errors"
+            )
+    except Exception as e:
+        LOGGER(__name__).error(f"Login command error: {e}")
+        await processing_msg.edit(
+            "❌ **Unexpected error occurred**\n\n"
+            "Please try again in a few minutes."
+        )
+
+
+@bot.on_message(filters.private & ~filters.command(["start", "help", "dl", "bdl", "dls", "bdls", "stats", "logs", "killall", "cleanup", "login", "setcaption", "resetcaption", "setchannel", "resetchannel"]))
 async def handle_any_message(bot: Client, message: Message):
+    user_id = message.from_user.id
+
+    # Handle in-progress login flow (OTP code / 2FA password)
+    if user_id in user_states and message.text:
+        if user_states[user_id] == "waiting_for_code":
+            success, response = await login_manager.verify_code(user_id, message.text)
+            if success:
+                del user_states[user_id]
+            elif "password" in response.lower():
+                user_states[user_id] = "waiting_for_password"
+            await message.reply(response)
+            return
+        elif user_states[user_id] == "waiting_for_password":
+            success, response = await login_manager.verify_password(user_id, message.text)
+            if success:
+                del user_states[user_id]
+            await message.reply(response)
+            return
+
     if message.text and not message.text.startswith("/"):
         text = message.text.strip()
         if is_story_link(text):

@@ -17,7 +17,7 @@ This guide covers setup, daily use, and safe shutdown/cleanup.
 
 1) **Clone the repo**
 ```
-git clone https://github.com/bisnuray/RestrictedContentDL
+git clone https://github.com/NotYourDeveloper/RestrictedContentDL
 cd RestrictedContentDL
 ```
 
