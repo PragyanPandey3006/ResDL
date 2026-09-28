@@ -134,9 +134,40 @@ def progressArgs(action: str, progress_message, start_time):
     return (action, progress_message, start_time, PROGRESS_BAR, "▓", "░")
 
 
+def _normalize_targets(forward_chat_ids, fallback_chat_id):
+    """Build a deduplicated, order-preserving list of destination chat IDs.
+
+    ``forward_chat_ids`` may be a single id, a list/tuple of ids, or None.
+    When it resolves to no usable targets we fall back to ``fallback_chat_id``
+    (the user's DM) so the download is never silently dropped.
+    """
+    if forward_chat_ids is None:
+        candidates = []
+    elif isinstance(forward_chat_ids, (list, tuple, set)):
+        candidates = list(forward_chat_ids)
+    else:
+        candidates = [forward_chat_ids]
+
+    seen = set()
+    targets = []
+    for cid in candidates:
+        if cid is None:
+            continue
+        if cid in seen:
+            continue
+        seen.add(cid)
+        targets.append(cid)
+
+    if not targets and fallback_chat_id is not None:
+        targets.append(fallback_chat_id)
+
+    return targets
+
+
 async def send_media(
     bot, message, media_path, media_type, caption, caption_entities,
-    progress_message, start_time, forward_chat_id=None, strip_caption=False
+    progress_message, start_time, forward_chat_ids=None, strip_caption=False,
+    forward_chat_id=None,
 ):
     file_size = os.path.getsize(media_path)
 
@@ -146,12 +177,13 @@ async def send_media(
     progress_args = progressArgs("📥 Uploading Progress", progress_message, start_time)
     LOGGER(__name__).info(f"Uploading media: {media_path} ({media_type})")
 
-    # Where the media should actually land. When a forward channel is configured
-    # we send DIRECTLY to it (no duplicate copy in the user's DM). Previously the
-    # bot always sent to the DM and *then* copied to the channel, so photos/videos
-    # showed up in the bot chat even after /setchannel. When no channel is set we
-    # keep the original behavior and reply in the user's chat.
-    target_chat_id = forward_chat_id or message.chat.id
+    # Accept either the new list-based ``forward_chat_ids`` or the legacy single
+    # ``forward_chat_id`` for backward compatibility. The media is uploaded once
+    # per destination (Telegram has no "send to many chats" primitive), reusing
+    # the same local file so the download only happens once.
+    if forward_chat_ids is None and forward_chat_id is not None:
+        forward_chat_ids = forward_chat_id
+    target_chat_ids = _normalize_targets(forward_chat_ids, message.chat.id)
 
     # Optionally drop the caption/entities entirely (used by media-type-only
     # whole-channel grabs where the user wants clean media).
@@ -159,12 +191,11 @@ async def send_media(
         caption = ""
         caption_entities = []
 
-    sent_message = None
+    last_sent_message = None
 
-    async def _send_once(cap, ents):
-        nonlocal sent_message
+    async def _send_once(target_chat_id, cap, ents):
         if media_type == "photo":
-            sent_message = await bot.send_photo(
+            return await bot.send_photo(
                 target_chat_id,
                 media_path,
                 caption=cap,
@@ -172,7 +203,6 @@ async def send_media(
                 progress=Leaves.progress_for_pyrogram,
                 progress_args=progress_args,
             )
-            return
         if media_type == "video":
             duration, _, _, width, height = await get_media_info(media_path)
 
@@ -186,7 +216,7 @@ async def send_media(
 
             thumb = await get_video_thumbnail(media_path, duration)
 
-            sent_message = await bot.send_video(
+            sent = await bot.send_video(
                 target_chat_id,
                 media_path,
                 duration=duration,
@@ -201,10 +231,10 @@ async def send_media(
             )
             if thumb:
                 cleanup_download(thumb)
-            return
+            return sent
         if media_type == "audio":
             duration, artist, title, _, _ = await get_media_info(media_path)
-            sent_message = await bot.send_audio(
+            return await bot.send_audio(
                 target_chat_id,
                 media_path,
                 duration=duration,
@@ -215,9 +245,8 @@ async def send_media(
                 progress=Leaves.progress_for_pyrogram,
                 progress_args=progress_args,
             )
-            return
         if media_type == "document":
-            sent_message = await bot.send_document(
+            return await bot.send_document(
                 target_chat_id,
                 media_path,
                 caption=cap,
@@ -225,31 +254,39 @@ async def send_media(
                 progress=Leaves.progress_for_pyrogram,
                 progress_args=progress_args,
             )
+        return None
 
-    cur_cap = caption or ""
-    cur_ents = caption_entities or []
-    for attempt in range(2):
-        try:
-            await _send_once(cur_cap, cur_ents)
-            break
-        except FloodWait as e:
-            wait_s = int(getattr(e, "value", 0) or 0)
-            LOGGER(__name__).warning(f"FloodWait while uploading media: {wait_s}s")
-            if wait_s > 0 and attempt == 0:
-                await asyncio.sleep(wait_s + 1)
-                continue
-            raise
-        except BadRequest as e:
-            if "ENTITY_TEXT_INVALID" in str(e) and attempt == 0:
-                LOGGER(__name__).warning(f"ENTITY_TEXT_INVALID in caption entities, retrying without entities: {e}")
-                cur_ents = []
-                continue
-            raise
+    # Send to every destination independently. A failure to deliver to one
+    # target (e.g. the bot was removed from a channel) must not stop delivery
+    # to the others.
+    for target_chat_id in target_chat_ids:
+        cur_cap = caption or ""
+        cur_ents = caption_entities or []
+        for attempt in range(2):
+            try:
+                sent = await _send_once(target_chat_id, cur_cap, cur_ents)
+                if sent is not None:
+                    last_sent_message = sent
+                break
+            except FloodWait as e:
+                wait_s = int(getattr(e, "value", 0) or 0)
+                LOGGER(__name__).warning(f"FloodWait while uploading media: {wait_s}s")
+                if wait_s > 0 and attempt == 0:
+                    await asyncio.sleep(wait_s + 1)
+                    continue
+                raise
+            except BadRequest as e:
+                if "ENTITY_TEXT_INVALID" in str(e) and attempt == 0:
+                    LOGGER(__name__).warning(f"ENTITY_TEXT_INVALID in caption entities, retrying without entities: {e}")
+                    cur_ents = []
+                    continue
+                LOGGER(__name__).error(f"Failed to send media to {target_chat_id}: {e}")
+                break
+            except Exception as e:
+                LOGGER(__name__).error(f"Failed to send media to {target_chat_id}: {e}")
+                break
 
-    # Media was sent directly to target_chat_id above (channel when set, else the
-    # user's DM). No extra copy needed — that used to create the duplicate that
-    # showed content in the DM even after /setchannel.
-    return sent_message
+    return last_sent_message
 
 
 async def download_single_media(msg, progress_message, start_time):
@@ -287,15 +324,20 @@ async def download_single_media(msg, progress_message, start_time):
     return ("skip", None, None)
 
 
-async def processMediaGroup(chat_message, bot, message, forward_chat_id=None,
-                            media_filter=None, strip_caption=False):
+async def processMediaGroup(chat_message, bot, message, forward_chat_ids=None,
+                            media_filter=None, strip_caption=False,
+                            forward_chat_id=None):
     media_group_messages = await chat_message.get_media_group()
     valid_media = []
     temp_paths = []
     invalid_paths = []
 
-    # Destination: the forward channel when set, otherwise the user's DM.
-    target_chat_id = forward_chat_id or message.chat.id
+    # Destinations: per-user /setchannel target and/or the global dump channel.
+    # Falls back to the user's DM when none are configured. Accepts the legacy
+    # single ``forward_chat_id`` for backward compatibility.
+    if forward_chat_ids is None and forward_chat_id is not None:
+        forward_chat_ids = forward_chat_id
+    target_chat_ids = _normalize_targets(forward_chat_ids, message.chat.id)
 
     start_time = time()
     progress_message = await message.reply("📥 Downloading media group...")
@@ -308,6 +350,8 @@ async def processMediaGroup(chat_message, bot, message, forward_chat_id=None,
             return bool(m.photo)
         if media_filter == "video":
             return bool(m.video)
+        if media_filter == "both":
+            return bool(m.photo) or bool(m.video)
         return True
 
     download_tasks = []
@@ -339,75 +383,88 @@ async def processMediaGroup(chat_message, bot, message, forward_chat_id=None,
             m.caption_entities = None
 
     if valid_media:
-        sent_messages = []
-        try:
-            for attempt in range(3):
-                try:
-                    sent_messages = await bot.send_media_group(chat_id=target_chat_id, media=valid_media)
-                    await progress_message.delete()
-                    break
-                except FloodWait as e:
-                    wait_s = int(getattr(e, "value", 0) or 0)
-                    LOGGER(__name__).warning(f"FloodWait while sending media group: {wait_s}s")
-                    if wait_s > 0 and attempt < 2:
-                        await asyncio.sleep(wait_s + 1)
-                        continue
-                    raise
-                except BadRequest as e:
-                    if "ENTITY_TEXT_INVALID" in str(e) and attempt == 0:
-                        LOGGER(__name__).warning(f"ENTITY_TEXT_INVALID in media group, retrying without caption entities: {e}")
-                        for m in valid_media:
-                            m.caption_entities = None
-                        continue
-                    raise
-        except Exception:
-            await message.reply(
-                "**❌ Failed to send media group, trying individual uploads**"
-            )
-            for media in valid_media:
-                try:
-                    sent = None
-                    if isinstance(media, InputMediaPhoto):
-                        sent = await bot.send_photo(
-                            chat_id=target_chat_id,
-                            photo=media.media,
-                            caption=media.caption,
+        async def _send_group_to(target_chat_id):
+            """Send the whole media group to one destination, with a per-item
+            fallback if the grouped send fails. Returns the sent messages."""
+            sent_messages = []
+            # send_media_group mutates nothing, but caption_entities may be
+            # stripped on ENTITY_TEXT_INVALID; work on a fresh reference each try.
+            try:
+                for attempt in range(3):
+                    try:
+                        sent_messages = await bot.send_media_group(chat_id=target_chat_id, media=valid_media)
+                        break
+                    except FloodWait as e:
+                        wait_s = int(getattr(e, "value", 0) or 0)
+                        LOGGER(__name__).warning(f"FloodWait while sending media group: {wait_s}s")
+                        if wait_s > 0 and attempt < 2:
+                            await asyncio.sleep(wait_s + 1)
+                            continue
+                        raise
+                    except BadRequest as e:
+                        if "ENTITY_TEXT_INVALID" in str(e) and attempt == 0:
+                            LOGGER(__name__).warning(f"ENTITY_TEXT_INVALID in media group, retrying without caption entities: {e}")
+                            for m in valid_media:
+                                m.caption_entities = None
+                            continue
+                        raise
+            except Exception:
+                await message.reply(
+                    "**❌ Failed to send media group, trying individual uploads**"
+                )
+                for media in valid_media:
+                    try:
+                        sent = None
+                        if isinstance(media, InputMediaPhoto):
+                            sent = await bot.send_photo(
+                                chat_id=target_chat_id,
+                                photo=media.media,
+                                caption=media.caption,
+                            )
+                        elif isinstance(media, InputMediaVideo):
+                            sent = await bot.send_video(
+                                chat_id=target_chat_id,
+                                video=media.media,
+                                caption=media.caption,
+                            )
+                        elif isinstance(media, InputMediaDocument):
+                            sent = await bot.send_document(
+                                chat_id=target_chat_id,
+                                document=media.media,
+                                caption=media.caption,
+                            )
+                        elif isinstance(media, InputMediaAudio):
+                            sent = await bot.send_audio(
+                                chat_id=target_chat_id,
+                                audio=media.media,
+                                caption=media.caption,
+                            )
+                        elif isinstance(media, Voice):
+                            sent = await bot.send_voice(
+                                chat_id=target_chat_id,
+                                voice=media.media,
+                                caption=media.caption,
+                            )
+                        if sent:
+                            sent_messages.append(sent)
+                    except Exception as individual_e:
+                        await message.reply(
+                            f"Failed to upload individual media: {individual_e}"
                         )
-                    elif isinstance(media, InputMediaVideo):
-                        sent = await bot.send_video(
-                            chat_id=target_chat_id,
-                            video=media.media,
-                            caption=media.caption,
-                        )
-                    elif isinstance(media, InputMediaDocument):
-                        sent = await bot.send_document(
-                            chat_id=target_chat_id,
-                            document=media.media,
-                            caption=media.caption,
-                        )
-                    elif isinstance(media, InputMediaAudio):
-                        sent = await bot.send_audio(
-                            chat_id=target_chat_id,
-                            audio=media.media,
-                            caption=media.caption,
-                        )
-                    elif isinstance(media, Voice):
-                        sent = await bot.send_voice(
-                            chat_id=target_chat_id,
-                            voice=media.media,
-                            caption=media.caption,
-                        )
-                    if sent:
-                        sent_messages.append(sent)
-                except Exception as individual_e:
-                    await message.reply(
-                        f"Failed to upload individual media: {individual_e}"
-                    )
+            return sent_messages
 
-            await progress_message.delete()
+        # Deliver to every destination. One target failing (e.g. bot removed
+        # from a channel) must not block the others.
+        for target_chat_id in target_chat_ids:
+            try:
+                await _send_group_to(target_chat_id)
+            except Exception as e:
+                LOGGER(__name__).error(f"Failed to send media group to {target_chat_id}: {e}")
 
-        # Media group was sent directly to target_chat_id (channel when set,
-        # else the user's DM), so no additional copy is required.
+        await progress_message.delete()
+
+        # Media group was sent to every target above (channel(s) + dump, or the
+        # user's DM when none configured), so no additional copy is required.
 
         for path in temp_paths + invalid_paths:
             cleanup_download(path)

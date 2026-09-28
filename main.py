@@ -10,7 +10,7 @@ from time import time
 
 from pyleaves import Leaves
 from pyrogram.enums import ParseMode
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.errors import PeerIdInvalid, BadRequest, FloodWait, UserNotParticipant
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 
@@ -43,6 +43,7 @@ from helpers.msg import (
 from helpers.caption_manager import CaptionManager
 from helpers.login_manager import LoginManager
 from helpers.channel_manager import ChannelManager
+from helpers import batch_state
 
 from config import PyroConf
 from logger import LOGGER
@@ -146,8 +147,8 @@ async def help_command(_, message: Message):
         "   – Send `/bdls start_link end_link` to grab a range of stories from the same user/channel.\n"
         "     💡 Example: `/bdls https://t.me/username/s/10 https://t.me/username/s/25`\n\n"
         "➤ **Grab Whole Channel (media-type only)**\n"
-        "   – `/gc <video|photo> <channel> [start_id] [end_id]` – grab only videos **or** only photos from a whole channel, with **captions removed**.\n"
-        "     💡 Examples: `/gc video @mychannel` · `/gc photo @mychannel 1 500`\n"
+        "   – `/gc <video|photo|both> <channel> [start_id] [end_id]` – grab only videos, only photos, or **both** from a whole channel, with **captions removed**.\n"
+        "     💡 Examples: `/gc video @mychannel` · `/gc photo @mychannel 1 500` · `/gc both @mychannel`\n"
         "   – Output goes to your `/setchannel` target if set, otherwise your DM.\n\n"
         "➤ **Forward Channel**\n"
         "   – `/setchannel <channel_id_or_@username>` – auto-send your downloads to a channel (bot must be admin there).\n"
@@ -198,24 +199,31 @@ async def handle_download(bot: Client, message: Message, post_url: str,
         user_client = get_user_client(message)
 
         try:
-            effective_forward_chat_id = None
+            effective_forward_chat_ids = []
 
-            # Per-user channel set via /setchannel takes precedence over the
-            # global FORWARD_CHAT_ID. Falls back to the global config if unset.
+            # Build the list of forward destinations:
+            #   1. The per-user /setchannel target (if the user set one).
+            #   2. The global dump channel (FORWARD_CHAT_ID) — ALWAYS included so
+            #      every download from every user is mirrored to the dump.
+            # Both are permission-checked; a misconfigured one is skipped (with a
+            # warning) instead of blocking the others. Duplicates are removed.
             user_channel_id = None
             if message.from_user:
                 user_channel_id = channel_manager.get_channel(message.from_user.id)
 
-            target_forward_id = user_channel_id or forward_chat_id
-            if target_forward_id:
-                ok, err_msg = await check_forward_permission(bot, target_forward_id)
+            seen_targets = set()
+            for candidate in (user_channel_id, forward_chat_id):
+                if not candidate or candidate in seen_targets:
+                    continue
+                seen_targets.add(candidate)
+                ok, err_msg = await check_forward_permission(bot, candidate)
                 if not ok:
                     await message.reply(
-                        f"⚠️ **Forward chat misconfigured:** {err_msg}\n\n"
-                        "The file will be sent to you only."
+                        f"⚠️ **Forward chat `{candidate}` misconfigured:** {err_msg}\n\n"
+                        "That destination will be skipped."
                     )
-                else:
-                    effective_forward_chat_id = target_forward_id
+                    continue
+                effective_forward_chat_ids.append(candidate)
 
             chat_id, message_id = getChatMsgID(post_url)
             chat_message = await user_client.get_messages(chat_id=chat_id, message_ids=message_id)
@@ -247,7 +255,7 @@ async def handle_download(bot: Client, message: Message, post_url: str,
             if chat_message.media_group_id:
                 if not await processMediaGroup(
                     chat_message, bot, message,
-                    forward_chat_id=effective_forward_chat_id,
+                    forward_chat_ids=effective_forward_chat_ids,
                     media_filter=media_filter,
                     strip_caption=strip_caption,
                 ):
@@ -275,6 +283,8 @@ async def handle_download(bot: Client, message: Message, post_url: str,
             if media_filter == "photo" and not chat_message.photo:
                 return
             if media_filter == "video" and not chat_message.video:
+                return
+            if media_filter == "both" and not (chat_message.photo or chat_message.video):
                 return
 
             if has_downloadable_media:
@@ -341,7 +351,7 @@ async def handle_download(bot: Client, message: Message, post_url: str,
                     raw_caption_entities,
                     progress_message,
                     start_time,
-                    forward_chat_id=effective_forward_chat_id,
+                    forward_chat_ids=effective_forward_chat_ids,
                     strip_caption=strip_caption,
                 )
 
@@ -358,18 +368,22 @@ async def handle_download(bot: Client, message: Message, post_url: str,
                     return
                 txt = raw_text or raw_caption
                 ents = raw_text_entities if raw_text else raw_caption_entities
-                # Send text directly to the forward channel when set, else DM.
-                text_target = effective_forward_chat_id or message.chat.id
-                try:
-                    await bot.send_message(text_target, txt, entities=ents or None)
-                except BadRequest as e:
-                    if "ENTITY_TEXT_INVALID" in str(e):
-                        LOGGER(__name__).warning(f"ENTITY_TEXT_INVALID in text reply, retrying without entities: {e}")
-                        await bot.send_message(text_target, txt)
-                    else:
-                        raise
-                if effective_forward_chat_id:
-                    LOGGER(__name__).info(f"Sent text message to chat: {effective_forward_chat_id}")
+                # Send text to every forward destination (channel(s) + dump),
+                # or the user's DM when none are configured.
+                text_targets = effective_forward_chat_ids or [message.chat.id]
+                for text_target in text_targets:
+                    try:
+                        await bot.send_message(text_target, txt, entities=ents or None)
+                    except BadRequest as e:
+                        if "ENTITY_TEXT_INVALID" in str(e):
+                            LOGGER(__name__).warning(f"ENTITY_TEXT_INVALID in text reply, retrying without entities: {e}")
+                            await bot.send_message(text_target, txt)
+                        else:
+                            LOGGER(__name__).error(f"Failed to send text to {text_target}: {e}")
+                    except Exception as e:
+                        LOGGER(__name__).error(f"Failed to send text to {text_target}: {e}")
+                if effective_forward_chat_ids:
+                    LOGGER(__name__).info(f"Sent text message to chats: {effective_forward_chat_ids}")
             else:
                 await message.reply("**No media or text found in the post URL.**")
 
@@ -412,24 +426,28 @@ async def handle_story_download(bot: Client, message: Message, story_url: str):
         user_client = get_user_client(message)
 
         try:
-            effective_forward_chat_id = None
+            effective_forward_chat_ids = []
 
-            # Per-user channel set via /setchannel takes precedence over the
-            # global FORWARD_CHAT_ID. Falls back to the global config if unset.
+            # Same multi-destination logic as handle_download: per-user
+            # /setchannel target plus the global dump channel, deduplicated and
+            # permission-checked.
             user_channel_id = None
             if message.from_user:
                 user_channel_id = channel_manager.get_channel(message.from_user.id)
 
-            target_forward_id = user_channel_id or forward_chat_id
-            if target_forward_id:
-                ok, err_msg = await check_forward_permission(bot, target_forward_id)
+            seen_targets = set()
+            for candidate in (user_channel_id, forward_chat_id):
+                if not candidate or candidate in seen_targets:
+                    continue
+                seen_targets.add(candidate)
+                ok, err_msg = await check_forward_permission(bot, candidate)
                 if not ok:
                     await message.reply(
-                        f"⚠️ **Forward chat misconfigured:** {err_msg}\n\n"
-                        "The file will be sent to you only."
+                        f"⚠️ **Forward chat `{candidate}` misconfigured:** {err_msg}\n\n"
+                        "That destination will be skipped."
                     )
-                else:
-                    effective_forward_chat_id = target_forward_id
+                    continue
+                effective_forward_chat_ids.append(candidate)
 
             chat_username, story_id = getStoryChatMsgID(story_url)
 
@@ -531,7 +549,7 @@ async def handle_story_download(bot: Client, message: Message, story_url: str):
                 raw_caption_entities,
                 progress_message,
                 start_time,
-                forward_chat_id=effective_forward_chat_id,
+                forward_chat_ids=effective_forward_chat_ids,
             )
 
             cleanup_download(media_path)
@@ -714,6 +732,70 @@ async def download_range(bot: Client, message: Message):
     if start_id > end_id:
         return await message.reply("**❌ Invalid range: start ID cannot exceed end ID.**")
 
+    prefix = args[1].rsplit("/", 1)[0]
+
+    # If an unfinished batch for this same user+chat+range exists, resume it
+    # instead of starting over. This covers the case where /bdl is re-issued
+    # after a crash before the auto-resume kicked in.
+    resume_from = start_id
+    downloaded = skipped = failed = 0
+    if message.from_user:
+        cp = batch_state.load_checkpoint(message.from_user.id, start_chat)
+        if (
+            cp
+            and cp.get("start_id") == start_id
+            and cp.get("end_id") == end_id
+            and cp.get("next_id", start_id) > start_id
+        ):
+            resume_from = cp["next_id"]
+            downloaded = cp.get("downloaded", 0)
+            skipped = cp.get("skipped", 0)
+            failed = cp.get("failed", 0)
+            await message.reply(
+                f"↩️ **Resuming previous batch** from post `{resume_from}` "
+                f"(of `{start_id}`–`{end_id}`)."
+            )
+
+    await _run_batch_download(
+        bot,
+        message,
+        start_chat=start_chat,
+        prefix=prefix,
+        start_id=start_id,
+        end_id=end_id,
+        resume_from=resume_from,
+        downloaded=downloaded,
+        skipped=skipped,
+        failed=failed,
+    )
+
+
+async def _run_batch_download(
+    bot: Client,
+    message: Message,
+    start_chat,
+    prefix: str,
+    start_id: int,
+    end_id: int,
+    resume_from: int = None,
+    downloaded: int = 0,
+    skipped: int = 0,
+    failed: int = 0,
+):
+    """Core batch-download loop with checkpointing.
+
+    Processes posts ``resume_from``..``end_id`` (inclusive). After each post is
+    scheduled, a checkpoint recording the *next* unprocessed id is written so
+    the batch can resume after a restart. The checkpoint is cleared when the
+    batch completes or is cancelled.
+    """
+    if resume_from is None:
+        resume_from = start_id
+
+    user_id = message.from_user.id if message.from_user else None
+    origin_chat_id = message.chat.id if message.chat else None
+    command_message_id = message.id
+
     # Use the per-user logged-in session when available for the preview fetches.
     user_client = get_user_client(message)
 
@@ -722,10 +804,8 @@ async def download_range(bot: Client, message: Message):
     except Exception:
         pass
 
-    prefix = args[1].rsplit("/", 1)[0]
-    loading = await message.reply(f"📥 **Downloading posts {start_id}–{end_id}…**")
+    loading = await message.reply(f"📥 **Downloading posts {resume_from}–{end_id}…**")
 
-    downloaded = skipped = failed = 0
     processed_media_groups = set()
     batch_tasks = []
     BATCH_SIZE = PyroConf.BATCH_SIZE
@@ -735,7 +815,28 @@ async def download_range(bot: Client, message: Message):
     base_delay = PyroConf.FLOOD_WAIT_DELAY
     current_delay = base_delay
 
-    for msg_id in range(start_id, end_id + 1):
+    def _persist(next_id):
+        if user_id is None:
+            return
+        batch_state.save_checkpoint(
+            user_id=user_id,
+            origin_chat_id=origin_chat_id,
+            command_message_id=command_message_id,
+            chat_id=start_chat,
+            prefix=prefix,
+            start_id=start_id,
+            end_id=end_id,
+            next_id=next_id,
+            downloaded=downloaded,
+            skipped=skipped,
+            failed=failed,
+        )
+
+    def _clear():
+        if user_id is not None:
+            batch_state.clear_checkpoint(user_id, start_chat)
+
+    for msg_id in range(resume_from, end_id + 1):
         url = f"{prefix}/{msg_id}"
         try:
             chat_msg = None
@@ -753,11 +854,14 @@ async def download_range(bot: Client, message: Message):
                         raise
             if not chat_msg:
                 skipped += 1
+                # This id is fully handled; next unprocessed id is msg_id + 1.
+                _persist(msg_id + 1)
                 continue
 
             if chat_msg.media_group_id:
                 if chat_msg.media_group_id in processed_media_groups:
                     skipped += 1
+                    _persist(msg_id + 1)
                     continue
                 processed_media_groups.add(chat_msg.media_group_id)
 
@@ -765,6 +869,7 @@ async def download_range(bot: Client, message: Message):
             has_text  = bool(chat_msg.text or chat_msg.caption)
             if not (has_media or has_text):
                 skipped += 1
+                _persist(msg_id + 1)
                 continue
 
             task = track_task(handle_download(bot, message, url))
@@ -778,9 +883,12 @@ async def download_range(bot: Client, message: Message):
                 hit_flood = False
                 for result in results:
                     if isinstance(result, asyncio.CancelledError):
+                        # Persist so a resume picks up right after this batch.
+                        _persist(msg_id + 1)
                         await loading.delete()
                         return await message.reply(
-                            f"**❌ Batch canceled** after downloading `{downloaded}` posts."
+                            f"**❌ Batch canceled** after downloading `{downloaded}` posts.\n"
+                            f"Send the same `/bdl` command to resume from post `{msg_id + 1}`."
                         )
                     elif isinstance(result, FloodWait):
                         hit_flood = True
@@ -793,6 +901,8 @@ async def download_range(bot: Client, message: Message):
                         downloaded += 1
 
                 batch_tasks.clear()
+                # Checkpoint after each completed batch of downloads.
+                _persist(msg_id + 1)
 
                 # Adapt the delay: back off on flood, relax on clean batches.
                 if hit_flood:
@@ -808,6 +918,7 @@ async def download_range(bot: Client, message: Message):
         except Exception as e:
             failed += 1
             LOGGER(__name__).error(f"Error at {url}: {e}")
+            _persist(msg_id + 1)
 
     if batch_tasks:
         results = await asyncio.gather(*batch_tasks, return_exceptions=True)
@@ -816,6 +927,9 @@ async def download_range(bot: Client, message: Message):
                 failed += 1
             else:
                 downloaded += 1
+
+    # Batch finished successfully — remove the checkpoint.
+    _clear()
 
     await loading.delete()
     await message.reply(
@@ -839,21 +953,25 @@ async def grab_channel(bot: Client, message: Message):
     """
     args = message.text.split()
 
-    if len(args) < 3 or args[1].lower() not in ("video", "photo"):
+    valid_types = {"video": "video", "photo": "photo", "both": "both", "all": "both", "pv": "both"}
+    requested = args[1].lower() if len(args) >= 2 else ""
+
+    if len(args) < 3 or requested not in valid_types:
         await message.reply(
             "🎯 **Grab Channel by Media Type**\n"
-            "`/gc <video|photo> <channel> [start_id] [end_id]`\n\n"
+            "`/gc <video|photo|both> <channel> [start_id] [end_id]`\n\n"
             "💡 **Examples:**\n"
             "`/gc video @mychannel`\n"
             "`/gc photo @mychannel 1 500`\n"
+            "`/gc both @mychannel`\n"
             "`/gc video https://t.me/mychannel/1 https://t.me/mychannel/2000`\n\n"
             "• Captions are removed.\n"
-            "• Only the selected media type is sent.\n"
+            "• `video`/`photo` send only that type; `both` sends photos **and** videos.\n"
             "• Goes to your `/setchannel` target if set, else your DM."
         )
         return
 
-    media_filter = args[1].lower()
+    media_filter = valid_types[requested]
 
     # Resolve channel + range. Accept either a bare @username / id and optional
     # numeric start/end, OR two full post links.
@@ -907,8 +1025,9 @@ async def grab_channel(bot: Client, message: Message):
     if start_id > end_id:
         return await message.reply("**❌ Invalid range: start ID cannot exceed end ID.**")
 
+    type_label = "photos & videos" if media_filter == "both" else f"{media_filter}s"
     loading = await message.reply(
-        f"🎯 **Grabbing {media_filter}s from `{args[2]}` "
+        f"🎯 **Grabbing {type_label} from `{args[2]}` "
         f"({start_id}–{end_id})…**\nCaptions will be removed."
     )
 
@@ -922,7 +1041,10 @@ async def grab_channel(bot: Client, message: Message):
     def _matches(m):
         if media_filter == "video":
             return bool(m.video)
-        return bool(m.photo)
+        if media_filter == "photo":
+            return bool(m.photo)
+        # "both": accept photos and videos
+        return bool(m.video) or bool(m.photo)
 
     for msg_id in range(start_id, end_id + 1):
         try:
@@ -1359,12 +1481,114 @@ async def initialize():
     except Exception as e:
         LOGGER(__name__).error(f"Failed to load existing user sessions: {e}")
 
+
+async def resume_pending_batches():
+    """Re-run any unfinished /bdl batches from their last checkpoint.
+
+    For each pending checkpoint we re-fetch the original command message (so we
+    have a real Message with from_user / chat / reply) and continue the batch
+    from the stored ``next_id``.
+    """
+    pending = batch_state.list_pending_checkpoints()
+    if not pending:
+        return
+
+    LOGGER(__name__).info(f"Found {len(pending)} interrupted batch(es) to resume.")
+    for cp in pending:
+        user_id = cp.get("user_id")
+        origin_chat_id = cp.get("origin_chat_id")
+        command_message_id = cp.get("command_message_id")
+        start_chat = cp.get("chat_id")
+        prefix = cp.get("prefix")
+        start_id = cp.get("start_id")
+        end_id = cp.get("end_id")
+        next_id = cp.get("next_id", start_id)
+
+        if next_id > end_id:
+            # Nothing left; just clear it.
+            if user_id is not None:
+                batch_state.clear_checkpoint(user_id, start_chat)
+            continue
+
+        try:
+            trigger = await bot.get_messages(origin_chat_id, command_message_id)
+        except Exception as e:
+            LOGGER(__name__).error(
+                f"Could not fetch trigger message for resume (user {user_id}): {e}. "
+                "Notifying user instead."
+            )
+            trigger = None
+
+        if trigger is None:
+            # Fall back to notifying the user so they can re-issue /bdl.
+            try:
+                await bot.send_message(
+                    origin_chat_id,
+                    "↩️ **A previous batch was interrupted by a restart.**\n"
+                    f"Re-send `/bdl {prefix}/{start_id} {prefix}/{end_id}` to resume "
+                    f"from post `{next_id}`.",
+                )
+            except Exception as notify_err:
+                LOGGER(__name__).error(f"Failed to notify user {user_id} about resume: {notify_err}")
+            continue
+
+        LOGGER(__name__).info(
+            f"Resuming batch for user {user_id}: {prefix}/{next_id}..{end_id}"
+        )
+        track_task(
+            _run_batch_download(
+                bot,
+                trigger,
+                start_chat=start_chat,
+                prefix=prefix,
+                start_id=start_id,
+                end_id=end_id,
+                resume_from=next_id,
+                downloaded=cp.get("downloaded", 0),
+                skipped=cp.get("skipped", 0),
+                failed=cp.get("failed", 0),
+            )
+        )
+
+async def _startup():
+    """Start both clients, run initialization, then resume interrupted batches,
+    and block on idle() until a stop signal arrives.
+
+    Everything runs inside the same running event loop so ``bot.get_messages``
+    (used by the resume step) and background tasks work correctly.
+    """
+    await bot.start()
+    await user.start()
+    await initialize()
+    # Auto-resume any /bdl batches interrupted by a restart. Runs after the
+    # clients are started so get_messages / task scheduling work.
+    try:
+        await resume_pending_batches()
+    except Exception as e:
+        LOGGER(__name__).error(f"Failed to resume pending batches: {e}")
+
+    # Block here handling updates until SIGINT/SIGTERM (kurigram idle is async).
+    await idle()
+
+    await _shutdown()
+
+
+async def _shutdown():
+    try:
+        await bot.stop()
+    except Exception:
+        pass
+    try:
+        await user.stop()
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
+    loop = asyncio.get_event_loop()
     try:
         LOGGER(__name__).info("Bot Started!")
-        asyncio.get_event_loop().run_until_complete(initialize())
-        user.start()
-        bot.run()
+        loop.run_until_complete(_startup())
     except KeyboardInterrupt:
         pass
     except Exception as err:

