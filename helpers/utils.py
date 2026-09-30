@@ -7,6 +7,7 @@ from time import time
 from uuid import uuid4
 from PIL import Image
 from logger import LOGGER
+from config import PyroConf
 from typing import Optional
 from asyncio.subprocess import PIPE
 from asyncio import create_subprocess_exec, create_subprocess_shell, wait_for
@@ -271,9 +272,15 @@ async def send_media(
             except FloodWait as e:
                 wait_s = int(getattr(e, "value", 0) or 0)
                 LOGGER(__name__).warning(f"FloodWait while uploading media: {wait_s}s")
-                if wait_s > 0 and attempt == 0:
+                cap = getattr(PyroConf, "MAX_FLOOD_WAIT", 300)
+                # Never freeze for hours: only retry if within the cap.
+                if attempt == 0 and 0 < wait_s <= cap:
                     await asyncio.sleep(wait_s + 1)
                     continue
+                if wait_s > cap:
+                    LOGGER(__name__).warning(
+                        f"FloodWait {wait_s}s exceeds cap {cap}s (upload); aborting."
+                    )
                 raise
             except BadRequest as e:
                 if "ENTITY_TEXT_INVALID" in str(e) and attempt == 0:
@@ -313,9 +320,15 @@ async def download_single_media(msg, progress_message, start_time):
         except FloodWait as e:
             wait_s = int(getattr(e, "value", 0) or 0)
             LOGGER(__name__).warning(f"FloodWait while downloading media: {wait_s}s")
-            if wait_s > 0 and attempt == 0:
+            cap = getattr(PyroConf, "MAX_FLOOD_WAIT", 300)
+            # Never freeze for hours: only retry if within the cap.
+            if attempt == 0 and 0 < wait_s <= cap:
                 await asyncio.sleep(wait_s + 1)
                 continue
+            if wait_s > cap:
+                LOGGER(__name__).warning(
+                    f"FloodWait {wait_s}s exceeds cap {cap}s (download); aborting."
+                )
             return ("error", None, None)
         except Exception as e:
             LOGGER(__name__).info(f"Error downloading media: {e}")

@@ -48,4 +48,19 @@ class PyroConf(object):
     # smooth request bursts. Helps avoid FloodWait on very large ranges.
     PER_POST_DELAY = float(getenv("PER_POST_DELAY", "1.5"))
 
+    # Maximum number of seconds the bot is allowed to sleep for a single
+    # Telegram FloodWait. If Telegram asks to wait longer than this, the bot
+    # will NOT block for hours — it aborts the current action and notifies the
+    # user instead. This is what stops the bot from "freezing". (default: 300s)
+    MAX_FLOOD_WAIT = int(getenv("MAX_FLOOD_WAIT", "300"))
+
+    # During a batch, if this many consecutive posts fail with CHANNEL_INVALID
+    # (or a similar access error), the batch aborts early and notifies the
+    # user, instead of spinning through thousands of doomed requests.
+    MAX_CHANNEL_INVALID_STREAK = int(getenv("MAX_CHANNEL_INVALID_STREAK", "10"))
+
     FORWARD_CHAT_ID = getenv("FORWARD_CHAT_ID", "").strip() or None
+
+    # Optional chat ID where the bot reports every problem/error centrally
+    # (e.g. an admin/log channel). Leave empty to only notify the user + logs.
+    NOTIFY_CHAT_ID = getenv("NOTIFY_CHAT_ID", "").strip() or None

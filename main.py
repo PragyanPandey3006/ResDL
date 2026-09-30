@@ -88,6 +88,125 @@ def track_task(coro):
     return task
 
 
+async def notify(
+    message: "Message | None" = None,
+    text: str = "",
+    *,
+    level: str = "error",
+    exc: "Exception | None" = None,
+    to_user: bool = True,
+):
+    """Centralized problem reporter.
+
+    Every problem in the bot should be routed through here so it is:
+      1. Written to the log file (always).
+      2. Sent to the user who triggered the action (when ``message`` is given
+         and ``to_user`` is True).
+      3. Sent to the central NOTIFY_CHAT_ID admin/log chat (when configured).
+
+    It never raises: notification must not itself crash the bot.
+    """
+    detail = f"{text}" + (f"\n`{exc}`" if exc else "")
+
+    # 1) Always log.
+    log = LOGGER(__name__)
+    if level == "warning":
+        log.warning(f"{text}{f' | {exc}' if exc else ''}")
+    elif level == "info":
+        log.info(f"{text}{f' | {exc}' if exc else ''}")
+    else:
+        log.error(f"{text}{f' | {exc}' if exc else ''}")
+
+    icon = {"error": "❌", "warning": "⚠️", "info": "ℹ️"}.get(level, "❌")
+    body = f"{icon} **Bot notice**\n{detail}"
+
+    # 2) Notify the triggering user.
+    if to_user and message is not None:
+        try:
+            await message.reply(body)
+        except Exception as e:
+            log.error(f"notify(): failed to reply to user: {e}")
+
+    # 3) Notify the central chat, if configured.
+    notify_chat = getattr(PyroConf, "NOTIFY_CHAT_ID", None)
+    if notify_chat:
+        try:
+            await bot.send_message(int(notify_chat), body)
+        except Exception as e:
+            log.error(f"notify(): failed to send to NOTIFY_CHAT_ID: {e}")
+
+
+def safe_handler(func):
+    """Decorator: make a command/message handler crash-proof.
+
+    Any exception raised inside a handler is caught here so it can NEVER
+    propagate up and disturb the event loop or stop the bot. Every failure is
+    routed through ``notify`` so it is logged, replied to the triggering user,
+    and forwarded to the central NOTIFY_CHAT_ID — satisfying "notify every
+    error". FloodWait is handled specially so we never freeze for hours.
+
+    Apply this to every ``@bot.on_message`` handler.
+    """
+    import functools
+
+    @functools.wraps(func)
+    async def wrapper(client, message, *args, **kwargs):
+        try:
+            return await func(client, message, *args, **kwargs)
+        except FloodWait as e:
+            # Never block the loop for a long flood wait inside a handler.
+            wait_s = int(getattr(e, "value", 0) or 0)
+            await notify(
+                message,
+                f"Action postponed: Telegram asked to wait `{wait_s}s`.",
+                level="warning",
+                exc=e if wait_s == 0 else None,
+            )
+        except asyncio.CancelledError:
+            # Respect cancellation (e.g. /cancel or shutdown) — re-raise so the
+            # task actually stops instead of being swallowed.
+            raise
+        except Exception as e:
+            # Catch-all: report through the central notifier and keep running.
+            try:
+                await notify(
+                    message,
+                    f"**Unexpected error in `{getattr(func, '__name__', 'handler')}`.** "
+                    "The bot is still running. Check /logs for details.",
+                    exc=e,
+                )
+            except Exception as notify_err:
+                # notify() should never raise, but guard anyway so the handler
+                # can't take the bot down under any circumstances.
+                LOGGER(__name__).error(
+                    f"safe_handler(): failed to notify about error in "
+                    f"{getattr(func, '__name__', 'handler')}: {notify_err} "
+                    f"(original error: {e})"
+                )
+
+    return wrapper
+
+
+async def capped_flood_sleep(exc: "FloodWait", context: str = "") -> bool:
+    """Sleep off a FloodWait, but never for longer than MAX_FLOOD_WAIT.
+
+    Returns True if the wait was within the cap and we slept it off (caller may
+    retry). Returns False if the wait exceeds the cap — in that case the caller
+    should abort the current action instead of freezing for hours.
+    """
+    wait_s = int(getattr(exc, "value", 0) or 0)
+    cap = getattr(PyroConf, "MAX_FLOOD_WAIT", 300)
+    if wait_s > cap:
+        LOGGER(__name__).warning(
+            f"FloodWait {wait_s}s exceeds cap {cap}s ({context}); aborting instead of freezing."
+        )
+        return False
+    if wait_s > 0:
+        LOGGER(__name__).warning(f"FloodWait {wait_s}s ({context}); sleeping within cap.")
+        await asyncio.sleep(wait_s + 1)
+    return True
+
+
 def get_user_client(message: Message) -> Client:
     """Return the Telegram user client to use for fetching/downloading content.
 
@@ -107,6 +226,7 @@ def get_user_client(message: Message) -> Client:
 
 
 @bot.on_message(filters.command("start") & filters.private)
+@safe_handler
 async def start(_, message: Message):
     welcome_text = (
         "👋 **Welcome to Media Downloader Bot!**\n\n"
@@ -126,6 +246,7 @@ async def start(_, message: Message):
 
 
 @bot.on_message(filters.command("help") & filters.private)
+@safe_handler
 async def help_command(_, message: Message):
     help_text = (
         "💡 **Media Downloader Bot Help**\n\n"
@@ -173,6 +294,7 @@ async def help_command(_, message: Message):
 
 
 @bot.on_message(filters.command("cleanup") & filters.private)
+@safe_handler
 async def cleanup_storage(_, message: Message):
     try:
         files_removed, bytes_freed = cleanup_downloads_root()
@@ -316,10 +438,16 @@ async def handle_download(bot: Client, message: Message, post_url: str,
                     except FloodWait as e:
                         wait_s = int(getattr(e, "value", 0) or 0)
                         LOGGER(__name__).warning(f"FloodWait while downloading media: {wait_s}s")
-                        if wait_s > 0 and attempt == 0:
-                            await asyncio.sleep(wait_s + 1)
+                        # Never freeze for hours: only retry if within the cap.
+                        if attempt == 0 and await capped_flood_sleep(e, "download media"):
                             continue
-                        raise
+                        await notify(
+                            message,
+                            f"Skipped a download: Telegram FloodWait of `{wait_s}s` "
+                            "exceeds the safe limit.",
+                            level="warning",
+                        )
+                        return
 
                 if not media_path or not os.path.exists(media_path):
                     await progress_message.edit("**❌ Download failed: File not saved properly**")
@@ -389,31 +517,34 @@ async def handle_download(bot: Client, message: Message, post_url: str,
 
         except FloodWait as e:
             wait_s = int(getattr(e, "value", 0) or 0)
-            LOGGER(__name__).warning(f"FloodWait in handle_download: {wait_s}s")
-            if wait_s > 0:
-                await asyncio.sleep(wait_s + 1)
+            # Cap the sleep so the bot never freezes for hours. If the wait is
+            # too long, report and return instead of blocking.
+            if not await capped_flood_sleep(e, "handle_download"):
+                await notify(
+                    message,
+                    f"Download postponed: Telegram asked to wait `{wait_s}s`, "
+                    "which exceeds the safe limit. Try again later.",
+                    level="warning",
+                )
             return
         except PeerIdInvalid as e:
-            LOGGER(__name__).error(f"PeerIdInvalid for {post_url}: {e}")
-            await message.reply(
-                "**❌ Access Denied**\n\n"
-                "The user client cannot access this chat.\n"
-                "Make sure the user account has joined the channel/group.\n\n"
-                f"**Details:** `{e}`"
+            await notify(
+                message,
+                "**Access Denied** — the user client cannot access this chat. "
+                "Make sure the account has joined the channel/group.",
+                exc=e,
             )
         except BadRequest as e:
-            LOGGER(__name__).error(f"BadRequest for {post_url}: {e}")
-            await message.reply(
-                "**❌ Bad Request**\n\n"
-                f"Telegram returned an error: `{e}`\n\n"
-                "This may happen if the message ID is invalid or the chat is inaccessible."
+            await notify(
+                message,
+                "**Bad Request** — Telegram rejected this. The message ID may be "
+                "invalid or the chat inaccessible.",
+                exc=e,
             )
         except KeyError as e:
-            LOGGER(__name__).error(f"KeyError for {post_url}: {e}")
-            await message.reply(f"**❌ Invalid URL format:** `{e}`")
+            await notify(message, "**Invalid URL format.**", exc=e)
         except Exception as e:
-            LOGGER(__name__).error(f"Unexpected error for {post_url}: {e}")
-            await message.reply("**❌ An unexpected error occurred.** Check /logs for details.")
+            await notify(message, "**An unexpected error occurred.** Check /logs for details.", exc=e)
 
 
 async def handle_story_download(bot: Client, message: Message, story_url: str):
@@ -584,6 +715,7 @@ async def handle_story_download(bot: Client, message: Message, story_url: str):
 
 
 @bot.on_message(filters.command("dl") & filters.private)
+@safe_handler
 async def download_media(bot: Client, message: Message):
     if len(message.command) < 2:
         await message.reply("**Provide a post URL after the /dl command.**")
@@ -594,6 +726,7 @@ async def download_media(bot: Client, message: Message):
 
 
 @bot.on_message(filters.command("dls") & filters.private)
+@safe_handler
 async def download_story(bot: Client, message: Message):
     if len(message.command) < 2:
         await message.reply(
@@ -614,6 +747,7 @@ async def download_story(bot: Client, message: Message):
 
 
 @bot.on_message(filters.command("bdls") & filters.private)
+@safe_handler
 async def download_story_range(bot: Client, message: Message):
     args = message.text.split()
 
@@ -709,6 +843,7 @@ async def download_story_range(bot: Client, message: Message):
 
 
 @bot.on_message(filters.command("bdl") & filters.private)
+@safe_handler
 async def download_range(bot: Client, message: Message):
     args = message.text.split()
 
@@ -814,6 +949,10 @@ async def _run_batch_download(
     # rate-limited/banned. It relaxes back down after clean batches.
     base_delay = PyroConf.FLOOD_WAIT_DELAY
     current_delay = base_delay
+    # Consecutive CHANNEL_INVALID / access failures. Crossing the configured
+    # threshold aborts the batch instead of spinning through doomed requests.
+    channel_invalid_streak = 0
+    MAX_CI_STREAK = PyroConf.MAX_CHANNEL_INVALID_STREAK
 
     def _persist(next_id):
         if user_id is None:
@@ -847,9 +986,20 @@ async def _run_batch_download(
                 except FloodWait as e:
                     wait_s = int(getattr(e, "value", 0) or 0)
                     LOGGER(__name__).warning(f"FloodWait fetching {url}: {wait_s}s")
+                    # Cap: never sleep longer than MAX_FLOOD_WAIT. If Telegram
+                    # asks for more, abort the whole batch cleanly.
+                    if not await capped_flood_sleep(e, f"fetch {url}"):
+                        _persist(msg_id)
+                        await loading.delete()
+                        await notify(
+                            message,
+                            f"**Batch paused.** Telegram asked to wait `{wait_s}s` "
+                            f"(over the `{PyroConf.MAX_FLOOD_WAIT}s` limit). "
+                            f"Re-send the `/bdl` command later to resume from post `{msg_id}`.",
+                            level="warning",
+                        )
+                        return
                     current_delay = min(current_delay + wait_s, 300)
-                    if wait_s > 0:
-                        await asyncio.sleep(wait_s + 1)
                     if attempt == 1:
                         raise
             if not chat_msg:
@@ -896,13 +1046,27 @@ async def _run_batch_download(
                         LOGGER(__name__).error(f"Error: {result}")
                     elif isinstance(result, Exception):
                         failed += 1
+                        if "CHANNEL_INVALID" in str(result) or "CHANNEL_PRIVATE" in str(result):
+                            channel_invalid_streak += 1
                         LOGGER(__name__).error(f"Error: {result}")
                     else:
                         downloaded += 1
+                        channel_invalid_streak = 0
 
                 batch_tasks.clear()
                 # Checkpoint after each completed batch of downloads.
                 _persist(msg_id + 1)
+
+                # If access failures piled up across this batch, abort.
+                if channel_invalid_streak >= MAX_CI_STREAK:
+                    await loading.delete()
+                    await notify(
+                        message,
+                        f"**Batch aborted.** `{channel_invalid_streak}` channel-access "
+                        "errors (CHANNEL_INVALID) in a row. The session account likely "
+                        "isn't a member of this channel. Join it and re-send the command.",
+                    )
+                    return
 
                 # Adapt the delay: back off on flood, relax on clean batches.
                 if hit_flood:
@@ -917,8 +1081,28 @@ async def _run_batch_download(
 
         except Exception as e:
             failed += 1
-            LOGGER(__name__).error(f"Error at {url}: {e}")
             _persist(msg_id + 1)
+            err = str(e)
+            if "CHANNEL_INVALID" in err or "CHANNEL_PRIVATE" in err or "PEER_ID_INVALID" in err.upper():
+                channel_invalid_streak += 1
+                LOGGER(__name__).error(
+                    f"Access error at {url} (streak {channel_invalid_streak}/{MAX_CI_STREAK}): {e}"
+                )
+                if channel_invalid_streak >= MAX_CI_STREAK:
+                    await loading.delete()
+                    await notify(
+                        message,
+                        f"**Batch aborted.** `{channel_invalid_streak}` posts in a row "
+                        "failed with a channel-access error (CHANNEL_INVALID).\n\n"
+                        "Your session account likely **isn't a member** of this channel, "
+                        "or the session lost access. Join the channel with the logged-in "
+                        "account (or /login) and re-send the command.",
+                    )
+                    return
+            else:
+                # Any non-access error breaks the streak.
+                channel_invalid_streak = 0
+                LOGGER(__name__).error(f"Error at {url}: {e}")
 
     if batch_tasks:
         results = await asyncio.gather(*batch_tasks, return_exceptions=True)
@@ -942,6 +1126,7 @@ async def _run_batch_download(
 
 
 @bot.on_message(filters.command("gc") & filters.private)
+@safe_handler
 async def grab_channel(bot: Client, message: Message):
     """Grab a whole channel filtered by media type (video/photo only).
 
@@ -1056,9 +1241,17 @@ async def grab_channel(bot: Client, message: Message):
                 except FloodWait as e:
                     wait_s = int(getattr(e, "value", 0) or 0)
                     LOGGER(__name__).warning(f"FloodWait fetching {msg_id}: {wait_s}s")
+                    # Cap: never freeze for hours on a single FloodWait.
+                    if not await capped_flood_sleep(e, f"gc fetch {msg_id}"):
+                        await loading.delete()
+                        await notify(
+                            message,
+                            f"**Grab paused.** Telegram asked to wait `{wait_s}s` "
+                            f"(over the `{PyroConf.MAX_FLOOD_WAIT}s` limit). Try again later.",
+                            level="warning",
+                        )
+                        return
                     current_delay = min(current_delay + wait_s, 300)
-                    if wait_s > 0:
-                        await asyncio.sleep(wait_s + 1)
                     if attempt == 1:
                         raise
             if not chat_msg:
@@ -1136,6 +1329,7 @@ async def grab_channel(bot: Client, message: Message):
 
 
 @bot.on_message(filters.command("setchannel") & filters.private)
+@safe_handler
 async def set_channel_command(_, message: Message):
     user_id = message.from_user.id
 
@@ -1223,6 +1417,7 @@ async def set_channel_command(_, message: Message):
 
 
 @bot.on_message(filters.command("resetchannel") & filters.private)
+@safe_handler
 async def reset_channel_command(_, message: Message):
     user_id = message.from_user.id
 
@@ -1243,6 +1438,7 @@ async def reset_channel_command(_, message: Message):
 
 
 @bot.on_message(filters.command("setcaption") & filters.private)
+@safe_handler
 async def set_caption_command(_, message: Message):
     user_id = message.from_user.id
 
@@ -1281,6 +1477,7 @@ async def set_caption_command(_, message: Message):
 
 
 @bot.on_message(filters.command("resetcaption") & filters.private)
+@safe_handler
 async def reset_caption_command(_, message: Message):
     user_id = message.from_user.id
 
@@ -1301,6 +1498,7 @@ async def reset_caption_command(_, message: Message):
 
 
 @bot.on_message(filters.command("login") & filters.private)
+@safe_handler
 async def login_command(_, message: Message):
     user_id = message.from_user.id
 
@@ -1351,6 +1549,7 @@ async def login_command(_, message: Message):
 
 
 @bot.on_message(filters.command("logout") & filters.private)
+@safe_handler
 async def logout_command(_, message: Message):
     user_id = message.from_user.id
 
@@ -1379,6 +1578,7 @@ async def logout_command(_, message: Message):
 
 
 @bot.on_message(filters.private & ~filters.command(["start", "help", "dl", "bdl", "dls", "bdls", "gc", "stats", "logs", "killall", "cleanup", "login", "logout", "setcaption", "resetcaption", "setchannel", "resetchannel"]))
+@safe_handler
 async def handle_any_message(bot: Client, message: Message):
     user_id = message.from_user.id
 
@@ -1408,6 +1608,7 @@ async def handle_any_message(bot: Client, message: Message):
 
 
 @bot.on_message(filters.command("stats") & filters.private)
+@safe_handler
 async def stats(_, message: Message):
     currentTime = get_readable_time(time() - PyroConf.BOT_START_TIME)
     total, used, free = shutil.disk_usage(".")
@@ -1442,6 +1643,7 @@ LOGS_AUTHORIZED_USERNAME = "fakepra"
 
 
 @bot.on_message(filters.command("logs") & filters.private)
+@safe_handler
 async def logs(_, message: Message):
     username = (message.from_user.username or "").lower()
     if username != LOGS_AUTHORIZED_USERNAME.lower():
@@ -1455,6 +1657,7 @@ async def logs(_, message: Message):
 
 
 @bot.on_message(filters.command("killall") & filters.private)
+@safe_handler
 async def cancel_all_tasks(_, message: Message):
     cancelled = 0
     for task in list(RUNNING_TASKS):
@@ -1550,6 +1753,33 @@ async def resume_pending_batches():
             )
         )
 
+async def _notify_chat_only(text: str, level: str = "error"):
+    """Send a notice to NOTIFY_CHAT_ID (and log it). Used where there is no
+    triggering user message (startup, shutdown, background crashes)."""
+    icon = {"error": "❌", "warning": "⚠️", "info": "ℹ️"}.get(level, "❌")
+    log = LOGGER(__name__)
+    (log.error if level == "error" else log.warning if level == "warning" else log.info)(text)
+    notify_chat = getattr(PyroConf, "NOTIFY_CHAT_ID", None)
+    if notify_chat:
+        try:
+            await bot.send_message(int(notify_chat), f"{icon} **Bot notice**\n{text}")
+        except Exception as e:
+            log.error(f"_notify_chat_only(): failed to send: {e}")
+
+
+def _loop_exception_handler(loop, context):
+    """Catch-all for exceptions in background tasks so a stray error is always
+    reported instead of silently killing a task."""
+    msg = context.get("exception", context.get("message"))
+    LOGGER(__name__).error(f"Unhandled exception in event loop: {msg}")
+    try:
+        loop.create_task(
+            _notify_chat_only(f"Unhandled background error: `{msg}`", level="error")
+        )
+    except Exception:
+        pass
+
+
 async def _startup():
     """Start both clients, run initialization, then resume interrupted batches,
     and block on idle() until a stop signal arrives.
@@ -1560,12 +1790,22 @@ async def _startup():
     await bot.start()
     await user.start()
     await initialize()
+
+    # Install a catch-all handler so no background task dies silently.
+    try:
+        asyncio.get_running_loop().set_exception_handler(_loop_exception_handler)
+    except Exception as e:
+        LOGGER(__name__).error(f"Could not set loop exception handler: {e}")
+
+    # Announce readiness to the central chat.
+    await _notify_chat_only("Bot started and ready. ✅", level="info")
+
     # Auto-resume any /bdl batches interrupted by a restart. Runs after the
     # clients are started so get_messages / task scheduling work.
     try:
         await resume_pending_batches()
     except Exception as e:
-        LOGGER(__name__).error(f"Failed to resume pending batches: {e}")
+        await _notify_chat_only(f"Failed to resume pending batches: `{e}`", level="error")
 
     # Block here handling updates until SIGINT/SIGTERM (kurigram idle is async).
     await idle()
@@ -1574,6 +1814,10 @@ async def _startup():
 
 
 async def _shutdown():
+    try:
+        await _notify_chat_only("Bot is shutting down.", level="warning")
+    except Exception:
+        pass
     try:
         await bot.stop()
     except Exception:
@@ -1593,5 +1837,12 @@ if __name__ == "__main__":
         pass
     except Exception as err:
         LOGGER(__name__).error(err)
+        # Best-effort: report the fatal error to the central chat before exit.
+        try:
+            loop.run_until_complete(
+                _notify_chat_only(f"Bot crashed with a fatal error: `{err}`", level="error")
+            )
+        except Exception:
+            pass
     finally:
         LOGGER(__name__).info("Bot Stopped")
